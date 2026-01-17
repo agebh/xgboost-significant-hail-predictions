@@ -1,3 +1,8 @@
+# In this script the labels are defined in the following:
+# - Hail = 1: >= 4.4cm
+# - no Hail = 0: no Reports
+# Hail sizes in between are not considered. No Reports are filtered with the population density mask. 
+
 # ========================================================================================================================
 # Preprocessing Imports
 # ========================================================================================================================
