@@ -345,6 +345,152 @@ for ii, (tr_idx, te_idx) in enumerate(zip(fold_train, fold_test)):
     # plt.show()
 
 # ========================================================================================================================
+# Analysis of observational data per year and month
+# ========================================================================================================================
+# --- Hail data on CONUS land only -----------------------------------------
+hail_bin_conus  = rgrNOAAObs[0, :, 14:110, :].astype(float)
+hail_size_conus = rgrNOAAObs[1, :, 14:110, :].astype(float)
+
+threshold_cm = 4.4
+
+# mask ocean
+hail_bin_conus[:,  LSM_US < 0.5] = np.nan
+hail_size_conus[:, LSM_US < 0.5] = np.nan
+
+# number of land grid cells (same for all years)
+valid_land = ~np.isnan(hail_bin_conus)
+n_land_cells = int(valid_land[0].sum())
+print("n_land_cells:", n_land_cells)
+
+# --- years 2000–2020 without 2003 -----------------------------------------
+years_all = np.unique(rgdTimeDD.year) # 1959-2024
+years_use = years_all[(years_all >= 2000) & (years_all <= 2024) & (years_all != 2003)]
+print("Years used:", years_use)
+
+# --- per-year totals ------------------------------------------------------
+large_total   = []  # absolute counts per year
+small_total   = []
+nohail_total  = []
+
+large_per_cell = []
+small_per_cell = []
+nohail_per_cell = []
+# --- per-year-per-month arrays --------------------------------------------
+n_years = len(years_use)
+large_per_cell_month  = np.zeros((n_years, 12))
+small_per_cell_month  = np.zeros((n_years, 12))
+nohail_per_cell_month = np.zeros((n_years, 12))
+
+for iy, yy in enumerate(years_use):
+    mask_y = (rgdTimeDD.year == yy)
+    hb_y   = hail_bin_conus[mask_y]     # shape: (T_y, H, W)
+    sz_y   = hail_size_conus[mask_y]
+
+    # boolean masks for each category (whole year)
+    large_mask = (hb_y == 1) & (sz_y >= threshold_cm)
+    small_mask = (hb_y == 1) & (sz_y <  threshold_cm)
+    no_mask   = (hb_y == 0)
+
+    # absolute counts per year (sum over time & space)
+    large_cnt = np.nansum(large_mask)
+    small_cnt = np.nansum(small_mask)
+    no_cnt = np.nansum(no_mask)
+
+    large_total.append(large_cnt)
+    small_total.append(small_cnt)
+    nohail_total.append(no_cnt)
+    
+    # normalize: reports per land grid cell and year
+    large_per_cell.append(large_cnt / n_land_cells)
+    small_per_cell.append(small_cnt / n_land_cells)
+    nohail_per_cell.append(no_cnt / n_land_cells)
+
+    # -------- per-month within this year --------
+    months_y = rgdTimeDD.month[mask_y]
+
+    for m in range(1, 13):
+        mask_ym = (months_y == m)
+        if not np.any(mask_ym):
+            continue
+
+        hb_ym = hb_y[mask_ym]
+        sz_ym = sz_y[mask_ym]
+
+        large_mask_ym = (hb_ym == 1) & (sz_ym >= threshold_cm)
+        small_mask_ym = (hb_ym == 1) & (sz_ym <  threshold_cm)
+        no_mask_ym    = (hb_ym == 0)
+
+        large_cnt_m = np.nansum(large_mask_ym)
+        small_cnt_m = np.nansum(small_mask_ym)
+        no_cnt_m    = np.nansum(no_mask_ym)
+
+        # normalize: reports per land grid cell and month
+        large_per_cell_month[iy, m-1]  = large_cnt_m / n_land_cells
+        small_per_cell_month[iy, m-1]  = small_cnt_m / n_land_cells
+        nohail_per_cell_month[iy, m-1] = no_cnt_m / n_land_cells
+
+large_total = np.array(large_total)
+small_total = np.array(small_total)
+nohail_total = np.array(nohail_total)
+large_per_cell = np.array(large_per_cell)
+small_per_cell = np.array(small_per_cell)
+nohail_per_cell = np.array(nohail_per_cell)
+#---------------------------------------------------------
+# Reports per land grid-cell and month
+month_idx    = np.arange(12)
+month_labels = ["Jan","Feb","Mar","Apr","May","Jun",
+                "Jul","Aug","Sep","Oct","Nov","Dec"]
+
+plt.figure(figsize=(9,6))
+for iy, yy in enumerate(years_use):
+    plt.plot(month_idx,
+             large_per_cell_month[iy],
+             alpha=0.4,
+             lw=1.5,
+            )
+
+plt.xticks(month_idx, month_labels)
+plt.ylabel("Reports per land grid-cell and month")
+plt.title(f"Monthly hail ≥{threshold_cm} cm per grid-cell\n2000–2024 (without 2003)")
+plt.grid(alpha=0.3)
+plt.tight_layout()
+plt.show()
+#---------------------------------------------------------
+month_idx    = np.arange(12)
+month_labels = ["Jan","Feb","Mar","Apr","May","Jun",
+                "Jul","Aug","Sep","Oct","Nov","Dec"]
+
+plt.figure(figsize=(9,6))
+for iy, yy in enumerate(years_use):
+    label = str(yy) if (iy % 5 == 0) else None  # avoid 21 labels; tweak as you like
+    plt.plot(month_idx,
+             small_per_cell_month[iy],
+             alpha=0.4,
+             lw=1.5,
+             label=label)
+
+plt.xticks(month_idx, month_labels)
+plt.ylabel("Reports per land grid-cell and month")
+plt.title(f"Monthly small-hail (<{threshold_cm} cm) per grid-cell\n2000–2024 (without 2003)")
+plt.grid(alpha=0.3)
+plt.legend(ncol=2, fontsize=8)
+plt.tight_layout()
+plt.show()
+#---------------------------------------------------------
+month_labels = ["Jan","Feb","Mar","Apr","May","Jun",
+                "Jul","Aug","Sep","Oct","Nov","Dec"]
+
+data_for_box = [large_per_cell_month[:,m] for m in range(12)]
+
+plt.figure(figsize=(10,6))
+plt.boxplot(data_for_box, tick_labels=month_labels, showfliers=True)
+plt.ylabel("Reports per land grid-cell and month")
+plt.title(f"Interannual variability of monthly large-hail (≥{threshold_cm} cm)\n2000–2024 (without 2003)")
+plt.grid(alpha=0.3)
+plt.tight_layout()
+plt.show()
+
+# ========================================================================================================================
 # Analysis on new predictions for selected model
 # ========================================================================================================================
 # ------------------------------------------------------------
