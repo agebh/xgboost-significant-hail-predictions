@@ -115,15 +115,13 @@ hail_sig_full = np.where((hail_bin_full == 1) & np.isfinite(hail_sz_full) & (hai
 for ii, (tr_idx, te_idx) in enumerate(zip(fold_train, fold_test)):
     print(f"\n=== Post-analysis for fold {ii} ===")
 
-    # --- 4.1) Rebuild test obs grid + mask
+    # --- 4.1) Rebuild test obs grid + mask ------------------
     # Use significant hail (NOT all hail)
     y_grid_hb_te = hail_sig_full[te_idx, 14:110, :].astype(np.float32)  # (T_test, H, W)
     y_grid_hb_te[:, LSM_US < 0.5] = np.nan
     valid_mask_te = ~np.isnan(y_grid_hb_te)  # land only (True where valid)
 
-    # -------------------------------
-    # 2) Load saved test probabilities
-    # -------------------------------
+    # --- 4.2) Load saved test probabilities -----------------
     y_test_prob_path = os.path.join(pred_dir, "20260116", f"fold{ii}_y_test_prob.npy")
     y_test_prob = np.load(y_test_prob_path)  # flattened over valid_mask_te (as in your training code)
 
@@ -132,9 +130,7 @@ for ii, (tr_idx, te_idx) in enumerate(zip(fold_train, fold_test)):
 
     hail_pred_bin_test = (prob_grid_test >= thr_bin).astype(np.int8)
 
-    # -------------------------------
-    # 3) Full-time obs cube (CONUS slice)
-    # -------------------------------
+    # --- 4.3) Full-time obs cube (CONUS slice) --------------
     hail_sig_conus = hail_sig_full[:, 14:110, :].astype(np.float32)  # (T_all, H, W)
     hail_sig_conus[:, LSM_US < 0.5] = np.nan
 
@@ -150,9 +146,7 @@ for ii, (tr_idx, te_idx) in enumerate(zip(fold_train, fold_test)):
     else:
         spatial_mask_monthly = np.ones_like(eval_mask_2d, dtype=bool)  # whole CONUS slice (land is NaN anyway)
 
-    # -------------------------------
-    # 4) Monthly OBS totals: train years & test years
-    # -------------------------------
+    # --- 4.4) Monthly OBS totals: train years & test years ----
     train_years = np.unique(rgdTimeDD.year[tr_idx])
     test_years  = np.unique(rgdTimeDD.year[te_idx])
     n_test_years = len(test_years)
@@ -178,9 +172,7 @@ for ii, (tr_idx, te_idx) in enumerate(zip(fold_train, fold_test)):
     ])
     obs_test_mean = np.nanmean(obs_test_monthly, axis=0)
 
-    # -------------------------------
-    # 5) Monthly MODEL totals on test split (mean per year)
-    # -------------------------------
+    # --- 4.5) Monthly MODEL totals on test split (mean per year) --
     months_test = pd.DatetimeIndex(rgdTimeDD[te_idx]).month  # (T_test,)
     use_probability_sums = False
 
@@ -199,9 +191,7 @@ for ii, (tr_idx, te_idx) in enumerate(zip(fold_train, fold_test)):
 
     model_monthly_per_year = model_monthly_total / max(1, n_test_years)
 
-    # -------------------------------
-    # 6) Plot monthly curves
-    # -------------------------------
+    # --- 4.6) Plot monthly curves -------------------------------------
     month_idx = np.arange(12)
     month_labels = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec']
 
@@ -244,9 +234,7 @@ for ii, (tr_idx, te_idx) in enumerate(zip(fold_train, fold_test)):
     plt.savefig(f"plots/monthly_fold{ii}.png", dpi=200, bbox_inches="tight")
     plt.show()
 
-    # ============================================================
-    # 7) Spatial maps: annual frequency per grid cell (obs vs model)
-    # ============================================================
+    # --- 7) Spatial maps: annual frequency per grid cell (obs vs model)
     # Build annual frequencies (events per grid cell per year) over the test split
     obs_freq_test = np.nansum(y_grid_hb_te, axis=0) / max(1, n_test_years)
     mod_freq_test = np.nansum(hail_pred_bin_test, axis=0) / max(1, n_test_years)
