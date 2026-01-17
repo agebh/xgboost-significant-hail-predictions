@@ -1,0 +1,152 @@
+import xgboost as xgb
+from xgboost import XGBClassifier
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import accuracy_score
+from dateutil import rrule
+import datetime
+from datetime import timedelta
+import glob
+from netCDF4 import Dataset
+import sys, traceback
+import dateutil.parser as dparser
+import string
+import numpy as np
+import numpy.ma as ma
+import os
+from pathlib import Path
+# from mpl_toolkits import basemap
+# import ESMF
+import pickle
+import subprocess
+import pandas as pd
+from scipy import stats
+import copy
+import matplotlib.pyplot as plt
+import matplotlib.colors as colors
+import matplotlib as mpl
+import pylab as plt
+import random
+import scipy.ndimage as ndimage
+import matplotlib.gridspec as gridspec
+# from mpl_toolkits.basemap import Basemap, cm
+from matplotlib.colors import LinearSegmentedColormap
+import matplotlib.gridspec as gridspec
+from pylab import *
+import string
+from matplotlib.patches import Polygon
+from matplotlib.collections import PatchCollection
+# import shapefile
+# import shapely.geometry
+import math
+from scipy.stats import gaussian_kde
+from math import radians, cos, sin, asin, sqrt
+# from shapely.geometry import Polygon, Point
+from scipy.interpolate import interp1d
+import csv
+import os.path
+import matplotlib.gridspec as gridspec
+import scipy
+import matplotlib.path as mplPath
+import calendar 
+from calendar import monthrange
+from calendar import isleap
+    
+from numpy import linspace, meshgrid
+from scipy.interpolate import griddata
+
+import os
+import matplotlib.pyplot as plt
+from netCDF4 import Dataset as netcdf_dataset
+import numpy as np
+import matplotlib.gridspec as gridspec
+import matplotlib.patches as mpatches
+
+from cartopy import config
+import cartopy.crs as ccrs
+import geopandas as gpd
+import cartopy.feature as cfeature
+
+from matplotlib.cm import ScalarMappable
+
+import random
+from matplotlib.colors import ListedColormap, LinearSegmentedColormap
+import matplotlib.colors as mcolors
+import matplotlib.patches as mpatch
+from matplotlib.ticker import LogLocator
+from matplotlib.colors import LogNorm
+from matplotlib.colors import ListedColormap, BoundaryNorm
+from matplotlib.colors import ListedColormap
+from sklearn.metrics import mean_squared_error
+from sklearn.metrics import confusion_matrix
+from sklearn.metrics import accuracy_score, f1_score
+from sklearn.metrics import roc_curve
+from sklearn.model_selection import cross_val_score, StratifiedKFold, StratifiedShuffleSplit
+from sklearn.metrics import roc_auc_score
+from sklearn.metrics import log_loss
+from sklearn.metrics import auc
+from hyperopt import space_eval
+
+from skopt import gp_minimize
+from skopt.space import Integer, Real
+from skopt.utils import use_named_args
+
+from hyperopt import fmin, tpe, hp, STATUS_OK, Trials
+import xarray as xr 
+from matplotlib.colors import LinearSegmentedColormap
+from typing import Optional, Tuple
+
+import scipy.ndimage as ndimage
+
+
+# Databases
+DB = {
+    "NOAA": {
+        "dir": "/nfs/cumulus/highres_nobackup/agebhardt/hail_observations/SPC_data_griddedERA/",
+        "pattern": "SPC-Hail-StormReports_gridded-75km_{year}.nc",
+        "years": range(1959, 2025),
+        "extent": [-130, -65, 23, 50],
+        "hail_var": "Hail",
+        "size_vars": ["HailSize", "size", "Size"],
+    },
+    "ESSL": {
+        "dir": "/nfs/cumulus/highres_nobackup/agebhardt/hail_observations/ESSL_data_griddedERA/",
+        "pattern": "ESSL-Hail-StormReports_gridded-ERA5_{year}.nc",
+        "years": range(1979, 2025),
+        "extent": [-10, 35, 35, 65],
+        "hail_var": "Hail",
+        "size_vars": ["size", "HailSize", "Size"],
+    },
+    "BoM": {
+        "dir": "/nfs/cumulus/highres_nobackup/agebhardt/hail_observations/BoM_data_griddedERA/",
+        "pattern": "BoM-Hail-StormReports_gridded-75km_{year}.nc",
+        "years": range(1959, 2022),
+        "extent": [110, 155, -45, -10],
+        "hail_var": "Hail",
+        "size_vars": ["HailSize", "size", "Size"],
+    },
+}
+
+def merge_years(dbkey: str, start_year: int, end_year: int, variable: str | None = None):
+    """
+    Merge all yearly NetCDF files for DB[dbkey] between start_year and end_year (inclusive)
+    and return the hail DataArray (by default DB[dbkey]["hail_var"]).
+    """
+    cfg = DB[dbkey] # cfg = configuration
+    years = [y for y in range(start_year, end_year + 1) if y in cfg["years"]]
+    if not years:
+        raise ValueError(f"No valid years in range for {dbkey}. Allowed: {cfg['years'].start}–{cfg['years'].stop - 1}")
+
+    # building the file paths
+    files = [os.path.join(cfg["dir"], cfg["pattern"].format(year=y)) for y in years]
+    files = [f for f in files if Path(f).exists()]
+    if not files:
+        raise FileNotFoundError(f"No files found for {dbkey} in {start_year}–{end_year}")
+
+    ds = xr.open_mfdataset(files, combine="by_coords")
+
+    hail_var = cfg["hail_var"]
+    size_var = next((n for n in cfg.get("size_vars", []) if n in ds.data_vars), None)
+    
+    return ds[[hail_var, size_var]]
+
+    
