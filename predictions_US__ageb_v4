@@ -1,1 +1,918 @@
+# ========================================================================================================================
+# Preprocessing Imports
+# ========================================================================================================================
+from pathlib import Path
+from datetime import datetime
+import calendar
+
+import numpy as np
+import pandas as pd
+import xarray as xr
+from netCDF4 import Dataset
+import scipy.ndimage as ndimage
+
+# ============================================================
+# 1) Settings / constants
+# ============================================================
+start_day = datetime(2000, 1, 1, 0)   # 2003 missing
+stop_day  = datetime(2022, 12, 31, 23)
+missing_year = 2003
+
+# NOAA CONUS slice # [14:110]
+noaa_lat_slice = slice(14, 110) 
+
+# ERA CONUS slice # [164:260]
+latn_us = 164
+lats_us = 260 
+
+# paths
+noaa_dir = Path("/nfs/cumulus/highres_nobackup/agebhardt/hail_observations/SPC_data_griddedERA")
+era_conus_dir = Path("/nfs/cumulus/highres_nobackup/agebhardt/e5_hailpredictors_conus")
+era_invar_dir = Path("/nfs/cumulus/highres_nobackup/agebhardt/e5_data_processing/e5_invariant")
+gpw_npz_path = Path("/nfs/cumulus/highres_nobackup/agebhardt/gpw/gpw_2020_era025.npz")
+
+era_const_fields = era_invar_dir / "e5_invariant_129_z_ll025sc.2020010100_2020010100.nc"
+lsm_file = era_invar_dir / "e5_lsm_11024sc.nc"
+
+# predictors
+model_vars = [
+    "CAPEmax", "SRH03", "VS03", "FLH",
+    "CINmax", "SRH06", "VS06", "DewT",
+    "TotalTotals", "RH850", "RH500",
+]
+era_vars = np.array([v for name in model_vars for v in name.split("-")])
+
+# ============================================================
+# 2) Time vectors
+# ============================================================
+rgdTimeDD = pd.date_range(start_day, end=stop_day, freq="D")
+rgdTime1H = pd.date_range(start_day, end=stop_day, freq="h")
+
+rgdTimeDD = rgdTimeDD[rgdTimeDD.year != missing_year]
+rgdTime1H = rgdTime1H[rgdTime1H.year != missing_year]
+
+iYears  = np.unique(rgdTimeDD.year)
+iMonths = np.unique(rgdTimeDD.month)
+
+# ============================================================
+# 3) Read NOAA observations
+# ============================================================
+hail_vars = ["Hail", "HailSize"]
+rgrNOAAObs = np.zeros((2, len(rgdTimeDD), 130, 300), dtype=np.float32)
+
+rgrLatNOAA = None
+rgrLonNOAA = None
+
+dd = 0
+for y in iYears:
+    nc_path = noaa_dir / f"SPC-Hail-StormReports_gridded-75km_{int(y)}.nc"
+    with Dataset(nc_path, mode="r") as nc:
+        # build lat/lon grids once
+        if rgrLatNOAA is None:
+            lat1d = np.squeeze(nc.variables["lat"][:, 0])
+            lon1d = np.squeeze(nc.variables["lon"][0, :])
+            rgrLonNOAA = np.tile(lon1d[None, :], (lat1d.size, 1))
+            rgrLatNOAA = np.tile(lat1d[:, None], (1, lon1d.size))
+
+        yearlength = 365 + int(calendar.isleap(int(y)))
+        for ii, vname in enumerate(hail_vars):
+            rgrNOAAObs[ii, dd:dd + yearlength, :, :] = np.squeeze(nc.variables[vname][:]).astype(np.float32)
+
+    dd += yearlength
+print(f"NOAA observations are read in...")
+
+# ============================================================
+# 4) Read ERA invariant fields (lat/lon/height) and shift lon to [-180, 180]
+# ============================================================
+with Dataset(era_const_fields, mode="r") as nc:
+    rgrLat = np.squeeze(nc.variables["latitude"][:]).astype(np.float32)     # (lat,)
+    rgrLon = np.squeeze(nc.variables["longitude"][:]).astype(np.float32)    # (lon,)
+    rgrHeight = (np.squeeze(nc.variables["z"][:]).astype(np.float32)) / 9.81
+
+# shift lon to [-180,180]
+rgrLon = np.where(rgrLon > 180, rgrLon - 360, rgrLon)
+
+# 2D lat/lon grids (optional, but matches your original)
+rgrLatERA = np.tile(rgrLat[:, None], (1, rgrLon.size))
+rgrLonERA = np.tile(rgrLon[None, :], (rgrLat.size, 1))
+print(f"ERA invariant fields are read in...")
+
+# ============================================================
+# 5) Match NOAA domain to ERA indices (CONUS lon indices) + derive nx/ny
+# ============================================================
+rgiLon = np.where((rgrLonERA[0, :] >= rgrLonNOAA[0, 0]) & (rgrLonERA[0, :] <= rgrLonNOAA[0, -1]))[0]
+iloW = int(rgiLon[0])
+iloE = int(rgiLon[-1] + 1)
+
+assert 0 <= latn_us < lats_us <= rgrLatERA.shape[0]
+
+ny = lats_us - latn_us
+nx = iloE - iloW
+
+lat_us = rgrLat[latn_us:lats_us]
+lon_us = rgrLon[iloW:iloE]
+
+print(f"NOAA domain matched to ERA indices...")
+print("CONUS shape (ny, nx):", ny, nx)
+
+# ============================================================
+# 6) Read ERA5 predictors (CONUS domain, yearly .npz)
+# ============================================================
+rgrERAVarall_US = np.zeros((len(rgdTimeDD), len(era_vars), ny, nx), dtype=np.float32)
+
+iyear = 0
+for y in iYears:
+    if int(y) == missing_year:
+        continue
+
+    infile = era_conus_dir / f"ERA5_new_predictors_conus_{int(y)}.npz"
+    data_tmp = np.load(infile)
+
+    rgrERAVarsyy = data_tmp["rgrERAVarsyy"].astype(np.float32)  # (T_year, F, ny, nx)
+    yearlength = rgrERAVarsyy.shape[0]
+
+    rgrERAVarall_US[iyear:iyear + yearlength, :, :, :] = rgrERAVarsyy
+    iyear += yearlength
+
+    # optional: keep these if you use them later
+    rgrLat_US = data_tmp.get("rgrLat", None)
+    rgrLon_US = data_tmp.get("rgrLon", None)
+
+print(f"ERA5 predictors read in...")
+
+# ============================================================
+# 7) Land-sea mask (CONUS)
+# ============================================================
+with Dataset(lsm_file, mode="r") as nc:
+    lsm = np.squeeze(nc.variables["lsm"][:]).astype(np.float32)
+
+LSM_US = lsm[latn_us:lats_us, iloW:iloE]
+
+# ============================================================
+# 8) Population density mask (top 15% + buffer), CONUS + NOAA crop
+# ============================================================
+with np.load(gpw_npz_path, allow_pickle=False) as npz:
+    popdens_data = npz["data"].astype("float32")
+    latitudes    = npz["lat"].astype("float32")
+    longitudes   = npz["lon"].astype("float32")
+    ref_year     = int(npz["year"])
+
+popdens_era = xr.DataArray(
+    popdens_data,
+    coords={"latitude": latitudes, "longitude": longitudes},
+    dims=("latitude", "longitude"),
+    name=f"gpw_pop_density_{ref_year}_era025",
+)
+
+# subset CONUS bbox (lon/lat slicing with xarray, keep your bbox)
+bbox_conus = (-135.0, -60.25, 20.25, 52.5)
+min_lon, max_lon, min_lat, max_lat = bbox_conus
+
+popdens_conus = popdens_era.sel(longitude=slice(min_lon, max_lon))
+lat_vals = popdens_conus.latitude.values
+lat_slice = slice(min_lat, max_lat) if lat_vals[0] <= lat_vals[-1] else slice(max_lat, min_lat)
+popdens_conus = popdens_conus.sel(latitude=lat_slice)
+
+popdens_threshold = float(np.nanpercentile(popdens_conus.values, 85))  # top 15%
+popmask_top15 = (popdens_conus >= popdens_threshold) & np.isfinite(popdens_conus.values)
+
+print(
+    f"Threshold = {popdens_threshold:.1f} ppl/km² | "
+    f"selected {int(popmask_top15.values.sum())} of {int(np.isfinite(popdens_conus.values).sum())} cells"
+)
+
+# crop to NOAA lat slice (14:110)
+eval_cells_conus = popmask_top15.values[noaa_lat_slice, :]
+
+# buffer (2 grid cells)
+radius_cells = 2
+structure = ndimage.iterate_structure(
+    ndimage.generate_binary_structure(rank=2, connectivity=1),
+    radius_cells,
+)
+mask_buffered = ndimage.binary_dilation(popmask_top15.values, structure=structure)
+eval_cells_conus_buffer = mask_buffered[noaa_lat_slice, :]
+
+print(f"Population density mask read in...")
+print("shape eval_cells_conus:", eval_cells_conus.shape)
+print("shape eval_cells_conus_buffer:", eval_cells_conus_buffer.shape)
+# ========================================================================================================================
+# Training and Tuning
+# ========================================================================================================================
+# ============================================================
+# 1) CV Settings + fold construction
+# ============================================================
+n_folds = 2
+year_start = 2000
+year_end = 2020 #2010
+block_size = 2
+
+all_years = pd.DatetimeIndex(rgdTimeDD).year
+years_all = np.unique(all_years)
+years_span = years_all[(years_all >= year_start) & (years_all <= year_end)]
+
+idx_by_year = {y: np.nonzero(all_years == y)[0] for y in years_span} # creating a dictionary
+idx_span_all = np.sort(np.concatenate([idx_by_year[y] for y in years_span]))
+
+blocks_all = [years_span[i:i+block_size] for i in range(0, len(years_span), block_size)]
+blocks = blocks_all[:n_folds]
+
+fold_test  = [np.sort(np.concatenate([idx_by_year[y] for y in block])) for block in blocks]
+fold_train = [np.setdiff1d(idx_span_all, te) for te in fold_test]
+
+for i, (block, te, tr) in enumerate(zip(blocks, fold_test, fold_train), 1):
+    test_years  = block.tolist()
+    train_years = [int(y) for y in years_span if y not in block]
+    print(f"Fold {i}: test {test_years} ({len(te)} days) | train {train_years} ({len(tr)} days)")
+
+# ============================================================
+# 2) Output folders (per run date)
+# ============================================================
+run_date = datetime.now().strftime("%Y%m%d")
+
+models_dir = Path("/cluster/home/agebhardt/models") / run_date
+preds_dir = Path("/cluster/home/agebhardt/predictions") / run_date
+stats_dir = Path("/cluster/home/agebhardt/statistics") / run_date
+plots_dir = Path("/cluster/home/agebhardt/plots") / run_date
+    
+for d in (models_dir, preds_dir, stats_dir, plots_dir):
+    d.mkdir(parents=True, exist_ok=True)
+
+# ============================================================
+# 3) function for hail stats
+# ============================================================
+def add_hail_stats_rows(hail_stats_rows, fold, dataset_name,
+                        months_flat, hb_flat, sz_flat,
+                        threshold_cm,
+                        ds_ratio=None, ds_div_factor=None):
+    """
+    Append per-month hail stats to hail_stats_rows.
+    hb_flat, sz_flat, months_flat are 1D arrays (only valid land points).
+    """
+    for m in range(1, 13):
+        mask_m = (months_flat == m)
+        if not np.any(mask_m):
+            continue
+
+        hb_m = hb_flat[mask_m]
+        sz_m = sz_flat[mask_m]
+
+        large = np.sum((hb_m == 1) & (sz_m >= threshold_cm))
+        small = np.sum((hb_m == 1) & (sz_m < threshold_cm))
+        no_h = np.sum(hb_m == 0)
+
+        hail_stats_rows.append({
+            "fold": fold,
+            "dataset": dataset_name,
+            "month": m,
+            "large_hail": int(large),
+            "small_hail": int(small),
+            "no_hail": int(no_h),
+            "ds_ratio": ds_ratio,
+            "ds_div_factor": ds_div_factor,
+        })
+
+# ============================================================
+# 4) run containers
+# ============================================================
+cv_results = []
+hail_stats_rows = []
+all_test = []
+all_test_prob = []
+
+# ============================================================
+# 5) CV LOOP (Building Labels, Tuning, Evaluating)
+# ============================================================
+for ii, (tr_idx, te_idx) in enumerate(zip(fold_train, fold_test)):
+    print(f"\n=== Fold {ii} | Train T={len(tr_idx)} | Test T={len(te_idx)} ===")
+    print(f"Fold {ii}: tr_idx shape={tr_idx.shape}, te_idx shape={te_idx.shape}")
+
+    threshold_cm = 4.4
+    ds_factor = 13.5
+    rng = np.random.default_rng(42 + ii)
+
+    # --- Load HAIL OBS --------------------------------------
+    # NOAA hail variable
+    hail_bin_US = rgrNOAAObs[0,:,:,:]  # presence/absence (0/1)
+    hail_size_US = rgrNOAAObs[1,:,:,:] # hail size in cm (may have NaNs)
+
+    # Subset to US domain and apply tr_idx
+    y_grid_hb = np.array(hail_bin_US[tr_idx,14:110,:]).astype(float)
+    y_grid_sz = np.array(hail_size_US[tr_idx, 14:110,:]).astype(float)
+    y_grid_hb[:,LSM_US < 0.5] = np.nan
+    y_grid_sz[:,LSM_US < 0.5] = np.nan
+
+    valid_mask = ~np.isnan(y_grid_hb)  # (T,96,300), valid_mask is masking the land grid
+    T,H,W = y_grid_hb.shape
+
+    # --- CAPEmax aligned with training samples --------------
+    cape_idx = list(rgsModelVars).index("CAPEmax")
+    cape_grid = rgrERAVarall_US[tr_idx, cape_idx,:, :].astype(np.float32)  # (T, ny, nx)
+    cape_grid[:, LSM_US < 0.5] = np.nan
+    
+    cape_flat_all = cape_grid[valid_mask]
+    
+    # --- population density mask ----------------------------
+    eval_mask_3d = np.broadcast_to(eval_cells_conus_buffer.values.astype(bool), y_grid_hb.shape)
+    eval_flat_all = eval_mask_3d[valid_mask]
+    
+    # --- 80%+20% for Hyperparameter tuning ------------------
+    # month-stratified splits
+    dates = pd.to_datetime(rgdTimeDD[tr_idx])
+    years = dates.year
+    months = dates.month.to_numpy()
+
+    tr_days_list   = []
+    val_days_list  = []
+    
+    for m in range(1, 13):
+        idx_m = np.where(months == m)[0]
+        if len(idx_m) == 0:
+            continue
+    
+        rng_m = np.random.default_rng(42 + ii + m)
+        perm_m = rng_m.permutation(idx_m)
+    
+        Tm = len(idx_m)
+        n_val = int(round(0.2 * Tm))   
+        val_m  = np.sort(perm_m[:n_val])
+        tr_m   = np.sort(perm_m[n_val:])
+    
+        tr_days_list.append(tr_m)
+        val_days_list.append(val_m)
+    
+    tr_days   = np.sort(np.concatenate(tr_days_list))
+    val_days  = np.sort(np.concatenate(val_days_list))
+
+    # --- BUILD 2 MASKS (timexlatxlon) -----------------------
+    # Each mask is True only where (day is in the subset) AND (cell is land)
+    tr_mask3d   = np.zeros_like(valid_mask, dtype=bool)
+    val_mask3d  = np.zeros_like(valid_mask, dtype=bool)
+
+    tr_mask3d[tr_days]    = valid_mask[tr_days]
+    val_mask3d[val_days]  = valid_mask[val_days]
+
+    overlap = np.count_nonzero(tr_mask3d & val_mask3d)
+    print("OVERLAP train/val (land cells):", overlap)  # must be 0
+    print("Day overlap:", np.intersect1d(tr_days, val_days).size)  # must be 0
+
+    # --- LABELS for 100% training data ----------------------
+    months_np = np.asarray(months)        
+    month_3d = np.broadcast_to(months_np[:, None, None], y_grid_hb.shape)
+    month_flat_train = month_3d[valid_mask]
+    
+    y_train_hb = y_grid_hb[valid_mask] # only land grid cells, 100% training data (boolean)
+    y_train_sz = y_grid_sz[valid_mask] # onyl land grid cells, 100% training data (hail size information)
+    y_train = np.where(y_train_hb == 1, (y_train_sz >= threshold_cm).astype(np.int8), 0)
+
+    add_hail_stats_rows(
+        hail_stats_rows,
+        fold=ii,
+        dataset_name="100_train_noDS",
+        months_flat=month_flat_train,
+        hb_flat=y_train_hb,
+        sz_flat=y_train_sz,
+        threshold_cm=threshold_cm,
+        ds_ratio=None,
+        ds_div_factor=None,
+    )
+
+    # --- DOWNSAMPLING 100% training data --------------------
+    # CAPE threshold
+    # noReport_mask = ((y_train_hb == 0) & np.isfinite(cape_flat_all) & cape_flat_all <= cape_thr)    
+    
+    # population density mask applied to "no reports"
+    noReport_mask = ((y_train_hb == 0) & eval_flat_all)   
+    idx_noReport = np.where(noReport_mask)[0]
+    
+    largeHail_mask = (y_train_hb == 1) & (y_train_sz >= threshold_cm)   
+    idx_largeHail = np.where(largeHail_mask)[0]
+
+    print(f"'No Reports' kept after pop thr (100% Training data without DS): {idx_noReport.size}")
+    print(f"'Positives' kept after sz thr (100% Training data): {idx_largeHail.size}")
+    
+    # random downsampling for balancing datasets    
+    rng100 = np.random.default_rng(123+ii)
+    
+    sel_noReport = rng100.choice(
+        idx_noReport,
+        size=int(len(idx_noReport) / ds_factor),
+        replace=False,
+    )
+    
+    idx_keep = np.sort(np.concatenate((sel_noReport, idx_largeHail))) # with random downsampling
+
+    print(f"'No Reports' kept after random DS (100% Training data with DS): {sel_noReport.size}")
+
+    month_flat_train_bal = month_flat_train[idx_keep]
+    y_train_hb_bal = y_train_hb[idx_keep]
+    y_train_sz_bal = y_train_sz[idx_keep]
+    y_train_bal = y_train[idx_keep]
+
+    pos = int(np.sum(y_train_bal == 1))
+    neg = int(np.sum(y_train_bal == 0))
+    
+    ds_div_factor = len(idx_noReport)/len(sel_noReport)
+    ds_ratio_100 = neg / max(1, pos)
+
+    add_hail_stats_rows(
+        hail_stats_rows,
+        fold=ii,
+        dataset_name="100_train_DS",
+        months_flat=month_flat_train_bal,
+        hb_flat=y_train_hb_bal,
+        sz_flat=y_train_sz_bal,
+        threshold_cm=threshold_cm,
+        ds_ratio=ds_ratio_100,
+        ds_div_factor=ds_div_factor,
+    )
+
+    # Result: y_train_bal
+
+    # --- PREDICTORS for 100% training -----------------------
+    X_grid = np.copy(rgrERAVarall_US[tr_idx, :, :, :]).astype(np.float32)  # (time,var,lat,lon)
+    X_grid[:, :, LSM_US < 0.5] = np.nan
+    X_f_tyx = np.moveaxis(X_grid, 1, 0)  # (F,T,Y,X)
+
+    # flatten
+    X_f_valid = X_f_tyx[:, valid_mask]  # (F,N)
+    X_f_valid[1, :] = np.abs(X_f_valid[1, :])
+    X_f_valid[5, :] = np.abs(X_f_valid[5, :])
+
+    X_train = X_f_valid.T
+    X_train_bal  = X_f_valid[:, idx_keep].T
+
+    #Result: X_train_bal
+
+    # --- LABELS for HP tuning (80% train + 20% val) ---------
+    # Flatten on land cells only, per mask
+    month_flat_tr = month_3d[tr_mask3d]
+    month_flat_val = month_3d[val_mask3d]
+    
+    y_tr_hb, y_tr_sz = y_grid_hb[tr_mask3d], y_grid_sz[tr_mask3d]
+    y_val_hb, y_val_sz = y_grid_hb[val_mask3d], y_grid_sz[val_mask3d]
+    y_tr = np.where(y_tr_hb == 1, (y_tr_sz >= threshold_cm).astype(np.int8), 0)
+    y_val = np.where(y_val_hb == 1, (y_val_sz >= threshold_cm).astype(np.int8), 0)
+
+    print("val positives:", int(y_val.sum()), " / n_val:", y_val.size, " prevalence:", float(y_val.mean()))
+    print("tr positives :", int(y_tr.sum()),  " / n_tr :", y_tr.size, " prevalence:", float(y_tr.mean()))
+
+    add_hail_stats_rows(
+        hail_stats_rows,
+        fold=ii,
+        dataset_name="80_train_noDS",
+        months_flat=month_flat_tr,
+        hb_flat=y_tr_hb,
+        sz_flat=y_tr_sz,
+        threshold_cm=threshold_cm,
+        ds_ratio=None,
+        ds_div_factor=None,
+    )
+
+    add_hail_stats_rows(
+        hail_stats_rows,
+        fold=ii,
+        dataset_name="20_val_noDS",
+        months_flat=month_flat_val,
+        hb_flat=y_val_hb,
+        sz_flat=y_val_sz,
+        threshold_cm=threshold_cm,
+        ds_ratio=None,
+        ds_div_factor=None,
+    )
+
+    # --- DOWNSAMPLING for HP tuning -------------------------
+    # CAPE threshold
+    # cape_flat_tr = cape_grid[tr_mask3d]
+    # noReport_mask = ((y_tr_hb == 0) & np.isfinite(cape_flat_tr) & (cape_flat_tr <= cape_thr))
+
+    # population density mask
+    eval_flat_tr = eval_mask_3d[tr_mask3d]
+    noReport_mask = ((y_tr_hb == 0) & (eval_flat_tr))
+    idx_noReport = np.where(noReport_mask)[0]
+
+    largeHail_mask = (y_tr_hb == 1) & (y_tr_sz >= threshold_cm)
+    idx_largeHail = np.where(largeHail_mask)[0]
+
+    print(f"'No Reports' kept after pop thr (80% Training data without DS): {idx_noReport.size}")
+    print(f"'Positives' kept after sz thr (80% Training data): {idx_largeHail.size}")
+
+    # random downsampling for balancing datasets    
+    n_largeHail = len(idx_largeHail)
+    neg_needed = int(ds_ratio_100 * n_largeHail) # total negatives desired
+    
+    rng80 = np.random.default_rng(321+ii)
+    
+    sel_noReport = rng80.choice(
+        idx_noReport, 
+        size=min(neg_needed, len(idx_noReport)), 
+        replace=False,
+    )
+    idx_keep = np.sort(np.concatenate((sel_noReport, idx_largeHail)))
+
+    print(f"'No Reports' kept after random DS (80% Training data with DS): {sel_noReport.size}")
+
+    y_tr_hb_bal = y_tr_hb[idx_keep]
+    y_tr_sz_bal = y_tr_sz[idx_keep]
+    y_tr_bal = y_tr[idx_keep]
+    month_flat_tr_bal = month_flat_tr[idx_keep]
+    
+    pos = int(np.sum(y_tr_bal == 1))
+    neg = int(np.sum(y_tr_bal == 0))    
+    ds_ratio_80 = neg / max(1, pos)
+    ds_div_factor = idx_noReport.size / max(1, sel_noReport.size)
+    
+    add_hail_stats_rows(
+        hail_stats_rows,
+        fold=ii,
+        dataset_name="80_train_DS",
+        months_flat=month_flat_tr_bal,
+        hb_flat=y_tr_hb_bal,
+        sz_flat=y_tr_sz_bal,
+        threshold_cm=threshold_cm,
+        ds_ratio=ds_ratio_80,
+        ds_div_factor=ds_div_factor,
+    )
+
+    # Result: y_tr_bal
+
+    # --- PREDICTORS for HP tuning ---------------------------
+    X_tr = X_f_tyx[:, tr_mask3d].T
+    X_val = X_f_tyx[:, val_mask3d].T
+
+    # feature abs-transform
+    X_tr[:,1] = np.abs(X_tr[:,1]);  X_tr[:,5] = np.abs(X_tr[:,5])
+    X_val[:,1] = np.abs(X_val[:,1]);  X_val[:,5] = np.abs(X_val[:,5])
+
+    X_tr_bal = X_tr[idx_keep,:]
+
+    # Result: X_tr_bal
+
+    # --- US test (no downsampling) --------------------------
+    # y-axis
+    y_grid_hb_te = np.array(hail_bin_US[te_idx,14:110,:]).astype(np.float32)
+    y_grid_hb_te[:,LSM_US < 0.5] = np.nan
+    valid_mask_te = ~np.isnan(y_grid_hb_te)
+    y_test_hb = y_grid_hb_te[valid_mask_te].astype(np.int8)
+
+    y_grid_sz_te = np.copy(hail_size_US[te_idx,14:110,:]).astype(np.float32)
+    y_grid_sz_te[:, LSM_US < 0.5] = np.nan
+    y_test_sz = y_grid_sz_te[valid_mask_te]
+    y_test = np.where(y_test_hb == 1, (y_test_sz >= threshold_cm).astype(np.int8), 0)
+
+    dates_te = pd.to_datetime(rgdTimeDD[te_idx])
+    months_te = dates_te.month
+    months_te_np = np.asarray(months_te)
+    month_te_3d = np.broadcast_to(months_te_np[:, None, None], y_grid_hb_te.shape)
+    month_flat_test = month_te_3d[valid_mask_te]
+
+    for m in range(1, 13):
+        mask_m = (month_flat_test == m)
+        if not np.any(mask_m):
+            continue
+    
+        y_m = y_test[mask_m]
+        large = int(np.sum(y_m == 1))
+        no_h  = int(np.sum(y_m == 0))
+    
+        hail_stats_rows.append({
+            "fold": ii,
+            "dataset": "test_noDS",
+            "month": m,
+            "large_hail": large,
+            "small_hail": 0,      # or np.nan if you prefer
+            "no_hail": no_h,
+            "ds_ratio": None,
+            "ds_div_factor": None,
+        })
+
+    # x-axis
+    X_grid_te = np.copy(rgrERAVarall_US[te_idx, :, :, :]).astype(np.float32)
+    X_grid_te[:,:,LSM_US < 0.5] = np.nan
+    X_f_tyx_te = np.moveaxis(X_grid_te, 1, 0)
+    X_f_valid_te = X_f_tyx_te[:, valid_mask_te]
+    X_f_valid_te[1, :] = np.abs(X_f_valid_te[1, :])
+    X_f_valid_te[5, :] = np.abs(X_f_valid_te[5, :])
+    X_test = X_f_valid_te.T
+
+    # ============================================================
+    # 5.1) DMatrices
+    # ============================================================
+    dtrain_balanced = xgb.DMatrix(X_train_bal, label=y_train_bal, missing=np.nan)  # 100% balanced
+    dte = xgb.DMatrix(X_test, label=y_test, missing=np.nan)  # test
+    
+    dtr_balanced = xgb.DMatrix(X_tr_bal, label=y_tr_bal, missing=np.nan)  # 80% balanced
+    dval_imbalanced = xgb.DMatrix(X_val, label=y_val, missing=np.nan)  # 20% val (no DS)
+
+    # ============================================================
+    # 5.2) Baseline model (defaults), untuned model
+    # ============================================================
+    base_params = {
+        'objective': 'binary:logistic',
+        'tree_method': 'hist',    # 'gpu_hist' if GPU
+        'eval_metric': 'aucpr',
+    }
+    
+    trial_params = {
+        "learning_rate":    0.1,
+        "max_depth":        6,
+        "min_child_weight": 1,
+        "subsample":        1.0,
+        "colsample_bytree": 1.0,
+        "alpha":            1,
+        "lambda":           1,
+    }
+    params = {**base_params, **trial_params}    
+
+    evals_result = {}
+    baseline_model = xgb.train(
+        params=params, 
+        dtrain=dtr_balanced, 
+        num_boost_round=100, #150 
+        evals=[(dtr_balanced, 'train'), (dval_imbalanced, 'valid')],
+        early_stopping_rounds=20,
+        evals_result=evals_result,
+        verbose_eval=False,
+    )
+
+    y_pred_proba = baseline_model.predict(dval_imbalanced)
+    precision, recall, _= precision_recall_curve(y_val, y_pred_proba)
+    aucpr_valid_untuned = auc(recall, precision)
+    prevalence_valid = np.mean(y_val)
+
+    # ============================================================
+    # 5.3) Optuna tuning on 80% train data and 20% val data
+    # ============================================================
+    base_params = {
+        'objective': 'binary:logistic',
+        'tree_method': 'hist',    # 'gpu_hist' if GPU
+        'eval_metric': 'aucpr',
+        'base_score': float(np.mean(y_tr_bal)),  # prior = pos fraction in 80% DS
+    }
+    
+    def objective(trial):
+        trial_params = {      
+            "learning_rate":    trial.suggest_float('learning_rate', 0.02, 0.05, log=True),
+            "max_depth":        trial.suggest_int("max_depth", 4, 7, step=1), # 2-10
+            "min_child_weight": trial.suggest_float("min_child_weight", 5, 20, log=True),
+            "subsample":        trial.suggest_float("subsample", 0.6, 0.9),
+            "colsample_bytree": trial.suggest_float("colsample_bytree", 0.6, 0.9),
+            "gamma":            trial.suggest_float("gamma", 0.01, 2, log=True), # 1e-8, 4,
+            "alpha":            trial.suggest_float("alpha", 0.01, 2, log=True), # 1e-8, 6,
+            "lambda":           trial.suggest_float("lambda", 0.5, 2, log=False),
+        }
+        params = {**base_params, **trial_params}
+
+        #pruning_cb = XGBoostPruningCallback(trial, "valid-aucpr")
+    
+        evals_result = {}
+        booster_hp_tuning = xgb.train(
+            params=params, 
+            dtrain=dtr_balanced, 
+            num_boost_round=200, #200
+            evals=[(dtr_balanced, 'train'), (dval_imbalanced, 'valid')],
+            early_stopping_rounds=20,
+            #callbacks=[pruning_cb],
+            evals_result=evals_result,
+            verbose_eval=False,
+        )
+
+        # store extra info for later inspection
+        trial.set_user_attr('best_iteration', int(booster_hp_tuning.best_iteration))
+        trial.set_user_attr("best_score", float(booster_hp_tuning.best_score))
+        trial.set_user_attr("evals_result", evals_result)
+            
+        return float(booster_hp_tuning.best_score)
+    
+    sampler = TPESampler(seed=42+ii)
+    pruner = optuna.pruners.MedianPrunder(
+        n_startup_trials=15,
+        n_warmup_steps=30,
+        interval_steps=5
+    )
+    study = optuna.create_study(
+        direction='maximize', 
+        sampler=sampler) 
+        #pruner=pruner)
+    study.optimize(objective, n_trials=5, show_progress_bar=False)
+
+    # ============================================================
+    # 5.4) Best trial summary
+    # ============================================================
+    best_trial = study.best_trial
+    best_iter  = best_trial.user_attrs.get("best_iteration")
+    best_params = {**base_params, **best_trial.params}
+    best_value  = best_trial.value
+    
+    print("\n=== Best trial summary ===")
+    print(f"Trial #{best_trial.number}")
+    print(f"Best valid AUCPR: {best_value:.6f}")
+    print(f"Best iteration: {best_iter}")
+    print("Best params:")
+    for k, v in best_trial.params.items():
+        print(f" {k}: {v}") 
+
+    # --- Top-11 trials --------------------------------------
+    df_trials = study.trials_dataframe(attrs=("number","value","state","params","user_attrs"))
+    df_complete = (
+        df_trials[df_trials["state"].astype(str).str.contains("COMPLETE", regex=False)]
+        .sort_values("value", ascending=False)
+        .reset_index(drop=True)
+    )
+        
+    df_top = df_complete.head(11).copy()
+    print(f"\n=== Top {len(df_top)} completed trials (best + next {max(0, len(df_top)-1)}) ===")
+
+    # --- save top-11 (best + next 10) -----------------------
+    top_csv_path = os.path.join(stats_dir, f"optuna_top11_fold{ii}.csv")
+    df_top.to_csv(top_csv_path, index=False)
+    print(f"\nSaved top-11 trials to: {top_csv_path}")
+        
+    # --- save all trials ------------------------------------
+    all_csv_path = os.path.join(stats_dir, f"optuna_trials_fold{ii}.csv")
+    df_trials.to_csv(all_csv_path, index=False)
+    print(f"Saved all Optuna trials to: {all_csv_path}") 
+        
+    # ============================================================
+    # 5.5) Optuna Visualizations
+    # ============================================================ 
+    # --- learning rate over boosting rounds -----------------
+    curves      = best_trial.user_attrs.get("evals_result")
+    train_aucpr = curves.get('train', {}).get('aucpr', [])
+    valid_aucpr = curves.get('valid', {}).get('aucpr', [])
+    epochs      = range(len(valid_aucpr))
+        
+    fig = plt.figure(figsize=(6,4))
+    plt.plot(epochs, train_aucpr, label='Train')
+    plt.plot(epochs, valid_aucpr, label='Valid')
+
+    plt.ylim(0,0.05)
+    plt.axhline(prevalence_valid, color="k", ls="--", lw=1, label="Baseline")
+    plt.legend()
+    plt.xlabel('Number of Boosting Rounds')
+    plt.ylabel('AUCPR')
+    plt.title('XGBoost AUCPR (best Optuna trial)')
+
+    plots_path = os.path.join(plots_dir, f"aucpr_fold{ii}.png")
+    fig.savefig(plots_path, dpi=200, bbox_inches = "tight")
+    plt.close(fig)
+    print(f"Saved AUCPR plot for fold {ii} to: {plots_path}")
+        
+    # --- contour plots --------------------------------------
+    fig_contour_lr_md = plot_contour(
+        study,
+        params=["learning_rate","max_depth"],
+    )
+    contour_path = os.path.join(plots_dir, f"optuna_contour_lr_md_fold{ii}.html")
+    fig_contour_lr_md.write_html(contour_path)
+    print(f"Saved Optuna contour plot for fold {ii} to: {contour_path}")
+
+    fig_contour_mcw_md = plot_contour(
+        study,
+        params=["min_child_weight","max_depth"],
+    )
+    contour_path = os.path.join(plots_dir, f"optuna_contour_mcw_md_fold{ii}.html")
+    fig_contour_mcw_md.write_html(contour_path)
+    print(f"Saved Optuna contour plot for fold {ii} to: {contour_path}")
+    
+    # --- Hyperparameter Importance Plot ---------------------
+
+
+
+
+
+    # ============================================================
+    # 5.6) Final model on 100% balanced + validation
+    # ============================================================
+    model_final = xgb.train(
+        params=best_params,
+        dtrain=dtrain_balanced,
+        num_boost_round=int(best_iter) + 1,
+        verbose_eval=False,
+    )
+    
+    # ============================================================
+    # 5.7) Predict on test + compute metrics
+    # ============================================================
+    # make predictions on test set
+    y_test_prob = model_final.predict(dte)
+    
+    all_test.append(y_test) # collect test data for later evaluation with global threshold
+    all_test_prob.append(y_test_prob) # collect test data for later evaluation with global threshold
+    
+    # ---- scalar probability metrics ----
+    aucroc_test = float(roc_auc_score(y_test, y_test_prob))
+    aucpr_test  = float(average_precision_score(y_test, y_test_prob))  # AUCPR (recommended for rare events)
+    logloss_test = float(log_loss(y_test, y_test_prob))
+    baseline_test = float(np.mean(y_test))
+    
+    pred_test_min    = float(y_test_prob.min())
+    pred_test_max    = float(y_test_prob.max())
+    pred_test_mean   = float(y_test_prob.mean())
+    pred_test_median = float(np.median(y_test_prob))
+    
+    # ---- threshold-based metrics (confusion matrix) ----
+    thr = 0.5  # IMPORTANT: consider choosing this from validation later
+    cm = confusion_metrics(y_test, y_test_prob, thr=thr)
+    cm_norm = confusion_matrix_normalized(y_test, y_test_prob, thr=thr, normalize="true")  # row-normalized
+    
+    print(
+        f"[Fold {ii}] AUCROC={aucroc_test:.4f} AUCPR={aucpr_test:.4f} LogLoss={logloss_test:.4f} "
+        f"| thr={thr:.2f} TP={cm['tp']} FP={cm['fp']} TN={cm['tn']} FN={cm['fn']} "
+        f"| Acc={cm['accuracy']:.4f} Prec={cm['precision']:.4f} "
+        f"Sens={cm['sensitivity']:.4f} Spec={cm['specificity']:.4f} F1={cm['f1']:.4f}"
+    )
+    
+    # ---- ROC + PR plots (per fold) ----
+    plot_prefix = os.path.join(stats_dir, f"fold{ii}")
+    _roc, _pr = plot_roc_pr(
+        y_true=y_test,
+        y_prob=y_test_prob,
+        title_prefix=f"Fold {ii}",
+        outpath_prefix=plot_prefix
+    )
+    
+    # ---- normalized confusion matrix plot (per fold) ----
+    plot_confmat(
+        cm_norm,
+        title=f"Fold {ii} Confusion Matrix (normalized by true class), thr={thr:.2f}",
+        outpath=plot_prefix + "_confmat_norm.png",
+    )
+    
+    # ---- gain + lift (per fold) ----
+    df_gl = gain_lift_by_decile(y_test, y_test_prob, n_bins=10)
+    df_gl.to_csv(os.path.join(stats_dir, f"fold{ii}_gain_lift.csv"), index=False)
+    plot_gain_lift(df_gl, title_prefix=f"Fold {ii}", outpath_prefix=plot_prefix)
+    
+    # ============================================================
+    # 5.8) Save model + predictions per fold
+    # ============================================================
+    model_path = os.path.join(models_dir, f"xgb_us_fold{ii}.json")
+    model_final.save_model(model_path)
+
+    np.save(os.path.join(preds_dir, f"fold{ii}_y_test_prob.npy"), y_test_prob)
+    #np.save(os.path.join(preds_dir, f"fold{ii}_y_test.npy"), y_test)
+
+    # ============================================================
+    # 5.9) Append fold results for statistics
+    # ============================================================
+    test_years  = np.unique(rgdTimeDD.year[te_idx])
+    test_period = f"{test_years.min()}-{test_years.max()}"
+    pred_years  = "-".join(map(str, test_years))
+    
+    cv_results.append(
+        {
+            "fold": ii,
+            "test_period": test_period,
+            "test_years": ",".join(map(str, test_years)),
+
+            # Untuned model on HP validation
+            "aucpr_valid_untuned": float(aucpr_valid_untuned),
+            "prevalence_valid": float(prevalence_valid),
+
+            #tuned model on HP validation
+            "aucpr_valid_tuned": float(best_value),
+            "best_iter": int(best_iter),
+            **{
+                f"P_{k}": float(v) if isinstance(v, (int, float)) else v 
+                for k, v in best_params.items()
+            },
+            
+            # Test metrics
+            "aucroc_test": aucroc_test,
+            "aucpr_test": aucpr_test,
+            "logloss_test": logloss_test,
+            "baseline_test": baseline_test,
+            
+            "pred_min_test": pred_test_min,
+            "pred_max_test": pred_test_max,
+            "pred_mean_test": pred_test_mean,
+            "pred_median_test": pred_test_median,
+            
+            # Confusion-matrix metrics (threshold-based)
+            "thr": cm["thr"],
+            "tp": cm["tp"], "fp": cm["fp"], "tn": cm["tn"], "fn": cm["fn"],
+            "accuracy": cm["accuracy"],
+            "precision_thr": cm["precision"],
+            "sensitivity": cm["sensitivity"],
+            "specificity": cm["specificity"],
+            "f1": cm["f1"],
+        }
+    )
+
+df_cv = pd.DataFrame(cv_results)
+print("\n=== Per-fold test metrics ===")
+print(df_cv[["fold","test_years","aucpr_test","baseline_test","logloss_test","best_iter"]])
+
+print("\nBest AP (Max):", df_cv["aucpr_test"].max(), 
+      " | Median AP:", df_cv["aucpr_test"].median(), 
+      " | Mean AP:", df_cv["aucpr_test"].mean())
+
+df_cv.to_csv(os.path.join(stats_dir, "cv_results_all_folds.csv"), index=False)
+print(f"\nSaved full CV results")
+
+df_hail = pd.DataFrame(hail_stats_rows)
+df_hail.to_csv(os.path.join(stats_dir, "hail_stats_per_fold_dataset_month.csv"), index=False)
+print(f"\nSaved hail statistics")
+
 
