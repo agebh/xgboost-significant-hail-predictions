@@ -12,3 +12,285 @@ import cartopy.feature as cfeature
 import xgboost as xgb
 from xgboost import plot_importance
 
+# ============================================================
+# 1) Settings / constants
+# ============================================================
+pred_dir = "/cluster/home/agebhardt/predictions"
+model_dir = "/cluster/home/agebhardt/models"
+
+thr_bin = 0.3 # threshold on probability for binary preds
+threshold_cm = 4.4 # IMPORTANT: must match training label
+extent_conus = [-127, -66, 24, 50]
+
+# Map options:
+# make BOTH maps: unmasked + masked to eval_cells_conus_buffer
+make_maps_unmasked = True
+make_maps_evalmask = True
+
+# Monthly curve options:
+# compare over eval_cells_conus_buffer or whole land
+monthly_use_evalmask = True
+
+# ============================================================
+# 2) Helpers
+# ============================================================
+def as_bool_mask_2d(mask_like):
+    """Return boolean numpy array (H,W) from np array or xarray DataArray."""
+    m = np.asarray(mask_like)
+    if m.dtype != bool:
+        m = m.astype(bool)
+    return m
+
+def monthly_obs_totals(mask_full_time, hail_bin_conus, rgdTimeDD, spatial_mask_2d):
+    """
+    Total hail events per month (12,) for a specific time mask.
+    hail_bin_conus: (T_all, H, W)
+    mask_full_time: (T_all,) bool
+    spatial_mask_2d: (H, W) bool
+    """
+    monthly_totals = np.zeros(12, dtype=float)
+    for m in range(1, 13):
+        sel_time = mask_full_time & (rgdTimeDD.month == m)
+        if not np.any(sel_time):
+            continue
+        monthly_totals[m - 1] = np.nansum(hail_bin_conus[sel_time][:, spatial_mask_2d])
+    return monthly_totals
+
+
+def plot_two_panel_map(lon2d, lat2d, field_left, field_right, title_left, title_right,
+                       suptitle, extent, cmap, norm, outpath=None):
+    fig = plt.figure(figsize=(14, 6))
+    plt.rcParams.update({"font.size": 12})
+
+    gs = gridspec.GridSpec(1, 2, figure=fig)
+    gs.update(left=0.04, right=0.96, bottom=0.10, top=0.90, wspace=0.18)
+
+    for idx, (ttl, fld) in enumerate([(title_left, field_left), (title_right, field_right)]):
+        ax = fig.add_subplot(gs[0, idx], projection=ccrs.PlateCarree())
+        pcm = ax.pcolormesh(
+            lon2d, lat2d, fld,
+            cmap=cmap, norm=norm,
+            transform=ccrs.PlateCarree(),
+            shading="auto",
+        )
+        ax.coastlines()
+        ax.add_feature(cfeature.BORDERS, linestyle="-", alpha=0.5)
+        ax.add_feature(cfeature.STATES, linestyle="-", edgecolor="black", alpha=0.5)
+        ax.set_extent(extent, crs=ccrs.PlateCarree())
+        ax.gridlines(draw_labels=True, linestyle=":", alpha=0.5)
+        ax.set_title(ttl)
+
+    cbar = fig.colorbar(
+        pcm,
+        ax=fig.axes,
+        orientation="horizontal",
+        fraction=0.05,
+        pad=0.08,
+        extend="max",
+    )
+    cbar.set_label("Annual hail frequency (events per grid cell)")
+
+    fig.suptitle(suptitle, y=0.97)
+    plt.show()
+
+    if outpath is not None:
+        os.makedirs(os.path.dirname(outpath), exist_ok=True)
+        fig.savefig(outpath, dpi=200, bbox_inches="tight")
+
+# ============================================================
+# 3) Prep masks / static grids
+# ============================================================
+eval_mask_2d = as_bool_mask_2d(eval_cells_conus_buffer)  # (H=96, W=300) expected for your CONUS slice
+
+# rgrNOAAObs:
+# [0,:,:,:] = hail presence/absence (all sizes) 0/1
+# [1,:,:,:] = hail size in cm (NaNs possible)
+hail_bin_full = rgrNOAAObs[0, :, :, :].astype(np.float32)
+hail_sz_full  = rgrNOAAObs[1, :, :, :].astype(np.float32)
+hail_sig_full = np.where((hail_bin_full == 1) & np.isfinite(hail_sz_full) & (hail_sz_full >= threshold_cm), 1, 0).astype(np.int8)
+
+# ============================================================
+# 4) Main loop
+# ============================================================
+for ii, (tr_idx, te_idx) in enumerate(zip(fold_train, fold_test)):
+    print(f"\n=== Post-analysis for fold {ii} ===")
+
+    # --- 4.1) Rebuild test obs grid + mask
+    # Use significant hail (NOT all hail)
+    y_grid_hb_te = hail_sig_full[te_idx, 14:110, :].astype(np.float32)  # (T_test, H, W)
+    y_grid_hb_te[:, LSM_US < 0.5] = np.nan
+    valid_mask_te = ~np.isnan(y_grid_hb_te)  # land only (True where valid)
+
+    # -------------------------------
+    # 2) Load saved test probabilities
+    # -------------------------------
+    y_test_prob_path = os.path.join(pred_dir, "20260116", f"fold{ii}_y_test_prob.npy")
+    y_test_prob = np.load(y_test_prob_path)  # flattened over valid_mask_te (as in your training code)
+
+    prob_grid_test = np.full_like(y_grid_hb_te, np.nan, dtype=np.float32)
+    prob_grid_test[valid_mask_te] = y_test_prob
+
+    hail_pred_bin_test = (prob_grid_test >= thr_bin).astype(np.int8)
+
+    # -------------------------------
+    # 3) Full-time obs cube (CONUS slice)
+    # -------------------------------
+    hail_sig_conus = hail_sig_full[:, 14:110, :].astype(np.float32)  # (T_all, H, W)
+    hail_sig_conus[:, LSM_US < 0.5] = np.nan
+
+    # Build train/test boolean masks over full time axis
+    is_train = np.zeros(rgdTimeDD.size, dtype=bool)
+    is_test  = np.zeros(rgdTimeDD.size, dtype=bool)
+    is_train[tr_idx] = True
+    is_test[te_idx]  = True
+
+    # Spatial mask for monthly totals
+    if monthly_use_evalmask:
+        spatial_mask_monthly = eval_mask_2d
+    else:
+        spatial_mask_monthly = np.ones_like(eval_mask_2d, dtype=bool)  # whole CONUS slice (land is NaN anyway)
+
+    # -------------------------------
+    # 4) Monthly OBS totals: train years & test years
+    # -------------------------------
+    train_years = np.unique(rgdTimeDD.year[tr_idx])
+    test_years  = np.unique(rgdTimeDD.year[te_idx])
+    n_test_years = len(test_years)
+
+    obs_train_monthly = np.vstack([
+        monthly_obs_totals(
+            mask_full_time=(rgdTimeDD.year == yr),
+            hail_bin_conus=hail_sig_conus,
+            rgdTimeDD=rgdTimeDD,
+            spatial_mask_2d=spatial_mask_monthly,
+        )
+        for yr in train_years
+    ])
+
+    obs_test_monthly = np.vstack([
+        monthly_obs_totals(
+            mask_full_time=((rgdTimeDD.year == yr) & is_test),
+            hail_bin_conus=hail_sig_conus,
+            rgdTimeDD=rgdTimeDD,
+            spatial_mask_2d=spatial_mask_monthly,
+        )
+        for yr in test_years
+    ])
+    obs_test_mean = np.nanmean(obs_test_monthly, axis=0)
+
+    # -------------------------------
+    # 5) Monthly MODEL totals on test split (mean per year)
+    # -------------------------------
+    months_test = pd.DatetimeIndex(rgdTimeDD[te_idx]).month  # (T_test,)
+    use_probability_sums = False
+
+    if use_probability_sums:
+        model_monthly_total = np.array([
+            np.nansum(prob_grid_test[months_test == m][:, spatial_mask_monthly])
+            for m in range(1, 13)
+        ], dtype=float)
+        label_model = f"Model (prob sums, mean/year, test {test_years.min()}–{test_years.max()})"
+    else:
+        model_monthly_total = np.array([
+            np.nansum(hail_pred_bin_test[months_test == m][:, spatial_mask_monthly])
+            for m in range(1, 13)
+        ], dtype=float)
+        label_model = f"Model (bin counts, mean/year, test {test_years.min()}–{test_years.max()})"
+
+    model_monthly_per_year = model_monthly_total / max(1, n_test_years)
+
+    # -------------------------------
+    # 6) Plot monthly curves
+    # -------------------------------
+    month_idx = np.arange(12)
+    month_labels = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec']
+
+    plt.figure(figsize=(9, 6))
+
+    # grey band = min/max across all observed years (train+test)
+    all_obs_monthly = np.vstack([obs_train_monthly, obs_test_monthly])
+    band_min = np.nanmin(all_obs_monthly, axis=0)
+    band_max = np.nanmax(all_obs_monthly, axis=0)
+    plt.fill_between(month_idx, band_min, band_max, color="0.7", alpha=0.30,
+                     label="Obs min–max (train+test yrs)")
+
+    # training-year curves
+    n_train_years = obs_train_monthly.shape[0]
+    alpha_lines = max(0.05, min(0.5, 10.0 / max(1, n_train_years)))
+    for i, yr in enumerate(train_years):
+        plt.plot(month_idx, obs_train_monthly[i], lw=1, alpha=alpha_lines, color="white",
+                 label="Obs train yrs" if i == 0 else None)
+
+    # mean train
+    obs_train_mean = np.nanmean(obs_train_monthly, axis=0)
+    plt.plot(month_idx, obs_train_mean, "k-", lw=3, label="Obs mean (train yrs)")
+
+    # mean test
+    plt.plot(month_idx, obs_test_mean, "--", lw=3, color="tab:red",
+             label=f"Obs mean (test yrs {test_years.min()}–{test_years.max()})")
+
+    # model
+    plt.plot(month_idx, model_monthly_per_year, lw=2.5, color="0.35", label=label_model)
+
+    plt.xticks(month_idx, month_labels)
+    plt.ylabel("Monthly significant hail events per year")
+    mask_txt = "eval mask" if monthly_use_evalmask else "all CONUS"
+    plt.title(f"Fold {ii}: train → test | monthly totals ({mask_txt}) | thr_bin={thr_bin}")
+    plt.grid(True, alpha=0.3)
+    plt.legend()
+    plt.tight_layout()
+
+    os.makedirs("plots", exist_ok=True)
+    plt.savefig(f"plots/monthly_fold{ii}.png", dpi=200, bbox_inches="tight")
+    plt.show()
+
+    # ============================================================
+    # 7) Spatial maps: annual frequency per grid cell (obs vs model)
+    # ============================================================
+    # Build annual frequencies (events per grid cell per year) over the test split
+    obs_freq_test = np.nansum(y_grid_hb_te, axis=0) / max(1, n_test_years)
+    mod_freq_test = np.nansum(hail_pred_bin_test, axis=0) / max(1, n_test_years)
+
+    # lon/lat for NOAA CONUS slice
+    lon_noaa_conus = rgrLonNOAA[14:110, :]
+    lat_noaa_conus = rgrLatNOAA[14:110, :]
+
+    # Colormap + bins (same as your previous map)
+    hail_prob_colors = [
+        (1, 1, 1), (0.8, 0.92, 1), (0.7, 0.85, 0.95),
+        (0.55, 0.75, 0.92), (0.33, 0.58, 0.9), (0.13, 0.38, 0.8),
+        (0.15, 0.3, 0.65), (0.12, 0.22, 0.55), (0.0, 0.4, 0),
+        (0.0, 0.7, 0.2), (1.0, 1.0, 0.0),
+        (1.0, 0.7, 0.0), (1.0, 0.4, 0.0), (1.0, 0, 0.0),
+        (0.9, 0.0, 0.0), (0.7, 0.0, 0.0), (0.5, 0.0, 0.0),
+    ]
+    cmap = ListedColormap(hail_prob_colors)
+    intervals = np.array([0.00, 0.01, 0.05, 0.10, 0.20, 0.35, 0.50, 0.70,
+                          1.00, 1.50, 2.0, 3.00, 4.0, 5.00, 7.0, 9.00, 10.0])
+    norm = mcolors.BoundaryNorm(intervals, len(intervals) - 1)
+
+    test_period = f"{test_years.min()}–{test_years.max()}"
+    suptitle = f"Fold {ii}: annual significant-hail frequency (≥{threshold_cm} cm) | test {test_period} | thr_bin={thr_bin}"
+
+    # --- Option 1: UNMASKED maps (whole CONUS slice, land already NaN in inputs)
+    if make_maps_unmasked:
+        plot_two_panel_map(
+            lon2d=lon_noaa_conus,
+            lat2d=lat_noaa_conus,
+            field_left=obs_freq_test,
+            field_right=mod_freq_test,
+            title_left=f"Observed (sig hail ≥{threshold_cm} cm)\n{test_period}",
+            title_right=f"Modeled (binary, thr={thr_bin})\n{test_period}",
+            suptitle=suptitle + " | unmasked",
+            extent=extent_conus,
+            cmap=cmap,
+            norm=norm,
+            outpath=f"maps/map_sig_hail_frequency_fold{ii}_unmasked.png",
+        )
+
+
+
+
+
+
+
