@@ -1,4 +1,6 @@
-# libraries
+# ============================================================
+# 0) libraries
+# ============================================================
 import calendar 
 from calendar import monthrange, isleap
 import csv
@@ -96,6 +98,9 @@ from optuna.integration import XGBoostPruningCallback
 
 import re
 
+# ============================================================
+# 1) Settings / constants
+# ============================================================
 dStartDay=datetime(2000, 1, 1, 0) # 2003 is missing
 dStopDay=datetime(2022, 12, 31,23)
     
@@ -156,7 +161,9 @@ rgsERAVariables_7n = np.array([item for sublist in rgsVarsAct_7n for item in sub
 rgsVarsAct=(np.array([rgsModelVars[ll].split('-') for ll in range(len(rgsModelVars))]))
 rgsERAVariables = np.array([item for sublist in rgsVarsAct for item in sublist])
 
-# Read Observations from NOAA
+# ============================================================
+# 2) Read Observations from NOAA
+# ============================================================
 sSaveFolder = ("/nfs/cumulus/highres_nobackup/agebhardt/hail_observations/SPC_data_griddedERA/")
 sDataSet = 'NOAA'
 
@@ -183,8 +190,9 @@ for ii in range(len(hailsize)):
         dd=dd+yearlength
         ncid.close()
 
-#--------------------------------------------------------------------------
-# Read latitude, longitude and height from ERA (sERAconstantFields)
+# ============================================================
+# 3) Read latitude, longitude and height from ERA (sERAconstantFields)
+# ============================================================
 rgsERAdata = "/nfs/cumulus/highres_nobackup/agebhardt/e5_hailpredictors/"
 rgsERAdata_conus = "/nfs/cumulus/highres_nobackup/agebhardt/e5_hailpredictors_conus/"
 sERAconstantFields = "/nfs/cumulus/highres_nobackup/agebhardt/e5_data_processing/e5_invariant/e5_invariant_129_z_ll025sc.2020010100_2020010100.nc"
@@ -203,9 +211,9 @@ rgrLonERA=np.asarray(([rgrLon,]*rgrLat.shape[0])) #lon2d_global
 rgi180=np.where(rgrLonERA > 180)
 rgrLonERA[rgi180]=rgrLonERA[rgi180]-360.
 
-# --------------------------------------------------------------------------
-# match NOAA-Domain to ERA5 → Lon-/Lat-Indices for CONUS
-# --------------------------------------------------------------------------
+# ============================================================
+# 4) match NOAA-Domain to ERA5 → Lon-/Lat-Indices for CONUS
+# ============================================================
 rgrLonAct = rgrLonNOAA
 rgrLatAct = rgrLatNOAA
 
@@ -241,9 +249,9 @@ lon_us = rgrLon[iloW:iloE]
 
 print("CONUS shape (ny, nx):", ny, nx)
 
-# --------------------------------------------------------------------------
-# ERA5-Prädiktoren: NUR CONUS lesen und als .npz pro Jahr speichern
-# --------------------------------------------------------------------------
+# ============================================================
+# 5) ERA5-Prädiktoren: NUR CONUS lesen und als .npz pro Jahr speichern
+# ============================================================
 conus_dir = "/nfs/cumulus/highres_nobackup/agebhardt/e5_hailpredictors_conus/"
 
 rgrERAVarall = np.zeros(
@@ -280,6 +288,9 @@ ncid.close()
 rgrERAVarall_US = rgrERAVarall
 LSM_US = LSM[164:260,iloW:iloE]
 
+# ============================================================
+# 6) Population density mask
+# ============================================================
 gpw_dir = "/nfs/cumulus/highres_nobackup/agebhardt/gpw/"
 npz_path = gpw_dir + "gpw_2020_era025.npz"
 
@@ -360,4 +371,36 @@ eval_cells_conus_buffer = xr.DataArray(
 
 print("shape of eval_cells_conus_buffer:", eval_cells_conus_buffer.shape)
 print("Buffered cells:", mask_buffered.sum())
+
+# ============================================================
+# 7) LOOCV
+# ============================================================
+n_folds = 2
+year_start = 2000
+year_end = 2020 #2010
+block_size = 2
+
+# years present in the time index, restricted to a desired span
+all_years = pd.DatetimeIndex(rgdTimeDD).year
+years_all = np.unique(all_years)
+years_span = years_all[(years_all >= year_start) & (years_all <= year_end)]
+
+# indices per year
+idx_by_year = {y: np.nonzero(all_years == y)[0] for y in years_span} # creating a dictionary
+idx_span_all = np.sort(np.concatenate([idx_by_year[y] for y in years_span]))
+
+# build all non-overlapping 2-year blocks (last block may be 1 year if odd number of years)
+blocks_all = [years_span[i:i+block_size] for i in range(0, len(years_span), block_size)]
+
+# keep only the first n_folds blocks
+blocks = blocks_all[:n_folds]
+
+fold_test  = [np.sort(np.concatenate([idx_by_year[y] for y in block])) for block in blocks]
+fold_train = [np.setdiff1d(idx_span_all, te) for te in fold_test]
+
+for i, (block, te, tr) in enumerate(zip(blocks, fold_test, fold_train), 1):
+    test_years  = block.tolist()
+    train_years = [int(y) for y in years_span if y not in block]
+    print(f"Fold {i}: test {test_years} ({len(te)} days) | train {train_years} ({len(tr)} days)")
+
 
