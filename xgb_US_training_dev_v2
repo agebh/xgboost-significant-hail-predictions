@@ -1,3 +1,9 @@
+# In this script the labels are defined in the following:
+# - Hail = 1: >= 4.4cm
+# - no Hail = 0: no Reports AND hail < 4.4cm 
+
+# No Reports are NOT filtered with the population density mask.
+
 # Standardbibliothek
 import calendar 
 from calendar import monthrange, isleap
