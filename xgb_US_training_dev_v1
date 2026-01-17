@@ -1281,3 +1281,216 @@ df_hail = pd.DataFrame(hail_stats_rows)
 df_hail.to_csv(os.path.join(stats_dir, "hail_stats_per_fold_dataset_month.csv"), index=False)
 print(f"\nSaved hail statistics")
 
+# ========================================================================================================================
+# Analysing changing DS factors in relation to Skill Score
+# ========================================================================================================================
+# ============================================================
+# SETTINGS
+# ============================================================
+ds_factors = [10, 12, 14, 16, 18, 20, 25, 30, 35, 40, 50, 60, 80, 100]      # <- choose
+num_boost_round = 150 # max rounds
+early_stopping_rounds = 20
+seed_base = 42
+threshold_cm = 4.4
+
+# fixed hyperparameters (no tuning)
+params = {
+    "objective": "binary:logistic",
+    "tree_method": "hist",   # "gpu_hist" if GPU
+    "eval_metric": "aucpr",
+    "learning_rate": 0.1,
+    "max_depth": 6,
+    "min_child_weight": 1,
+    "subsample": 1.0,
+    "colsample_bytree": 1.0,
+    "alpha": 1.0,
+    "lambda": 1.0,
+}
+
+# ============================================================
+# HELPERS
+# ============================================================
+def month_stratified_split(dates, fold_seed, val_frac=0.2):
+    """Return indices (relative to tr_idx time axis) for train-days and val-days."""
+    months = pd.to_datetime(dates).month.to_numpy()
+    tr_days_list, val_days_list = [], []
+    for m in range(1, 13):
+        idx_m = np.where(months == m)[0]
+        if idx_m.size == 0:
+            continue
+        rng = np.random.default_rng(fold_seed + m)
+        perm = rng.permutation(idx_m)
+        n_val = int(round(val_frac * idx_m.size))
+        val_days_list.append(np.sort(perm[:n_val]))
+        tr_days_list.append(np.sort(perm[n_val:]))
+    tr_days  = np.sort(np.concatenate(tr_days_list)) if tr_days_list else np.array([], dtype=int)
+    val_days = np.sort(np.concatenate(val_days_list)) if val_days_list else np.array([], dtype=int)
+    return tr_days, val_days
+
+
+def downsample_train_indices(y_hb, y_sz, eval_flat, ds_factor, rng, threshold_cm):
+    """
+    Keep all positives (hail >= threshold) and downsample negatives (no reports) by ds_factor.
+    """
+    neg_mask = (y_hb == 0) & (eval_flat)
+    pos_mask = (y_hb == 1) & (y_sz >= threshold_cm)
+
+    idx_neg = np.where(neg_mask)[0]
+    idx_pos = np.where(pos_mask)[0]
+
+    n_keep_neg = int(len(idx_neg) / float(ds_factor))
+    n_keep_neg = max(0, min(n_keep_neg, len(idx_neg)))
+
+    sel_neg = rng.choice(idx_neg, size=n_keep_neg, replace=False) if n_keep_neg > 0 else np.array([], dtype=int)
+    idx_keep = np.sort(np.concatenate([sel_neg, idx_pos]))
+    return idx_keep
+
+
+def aucpr_from_probs(y_true, y_prob):
+    prec, rec, _ = precision_recall_curve(y_true, y_prob)
+    return float(auc(rec, prec))
+
+
+# ============================================================
+# CORE: build DMatrices for a fold and ds_factor
+# ============================================================
+def build_dmats_for_fold_ds(ii, tr_idx, te_idx, ds_factor):
+    """
+    Returns dtr_balanced, dval_imbalanced, dtest, y_test
+    - ds_factor affects ONLY dtr_balanced
+    - validation + test are NOT downsampled
+    """
+    # ----------------------------
+    # A) TRAIN: labels on land grid
+    # ----------------------------
+    hail_bin_US  = rgrNOAAObs[0, :, :, :]
+    hail_size_US = rgrNOAAObs[1, :, :, :]
+
+    y_grid_hb = np.array(hail_bin_US[tr_idx, 14:110, :]).astype(np.float32)
+    y_grid_sz = np.array(hail_size_US[tr_idx, 14:110, :]).astype(np.float32)
+    y_grid_hb[:, LSM_US < 0.5] = np.nan
+    y_grid_sz[:, LSM_US < 0.5] = np.nan
+    valid_mask = ~np.isnan(y_grid_hb)  # (T,Y,X)
+
+    # month-stratified split of DAYS (relative to this fold's tr_idx)
+    dates_tr = pd.to_datetime(rgdTimeDD[tr_idx])
+    tr_days, val_days = month_stratified_split(dates_tr, fold_seed=seed_base + ii, val_frac=0.2)
+
+    tr_mask3d = np.zeros_like(valid_mask, dtype=bool)
+    val_mask3d = np.zeros_like(valid_mask, dtype=bool)
+    tr_mask3d[tr_days] = valid_mask[tr_days]
+    val_mask3d[val_days] = valid_mask[val_days]
+
+    # population density / eval mask (same as your code)
+    eval_mask_3d = np.broadcast_to(eval_cells_conus_buffer.values.astype(bool), y_grid_hb.shape)
+    eval_flat_tr = eval_mask_3d[tr_mask3d]
+
+    # y for (80%) training subset and (20%) validation subset
+    y_tr_hb, y_tr_sz = y_grid_hb[tr_mask3d], y_grid_sz[tr_mask3d]
+    y_val_hb, y_val_sz = y_grid_hb[val_mask3d], y_grid_sz[val_mask3d]
+    y_tr  = np.where(y_tr_hb == 1, (y_tr_sz >= threshold_cm).astype(np.int8), 0)
+    y_val = np.where(y_val_hb == 1, (y_val_sz >= threshold_cm).astype(np.int8), 0)
+
+    # ----------------------------
+    # B) TRAIN/VAL: predictors on land grid
+    # ----------------------------
+    X_grid = np.array(rgrERAVarall_US[tr_idx, :, :, :]).astype(np.float32)  # (T,F,lat,lon)
+    X_grid[:, :, LSM_US < 0.5] = np.nan
+    X_f_tyx = np.moveaxis(X_grid, 1, 0)  # (F,T,Y,X)
+
+    X_tr = X_f_tyx[:, tr_mask3d].T
+    X_val = X_f_tyx[:, val_mask3d].T
+
+    # abs transform (your features)
+    X_tr[:, 1] = np.abs(X_tr[:, 1]); X_tr[:, 5] = np.abs(X_tr[:, 5])
+    X_val[:, 1] = np.abs(X_val[:, 1]); X_val[:, 5] = np.abs(X_val[:, 5])
+
+    # downsample TRAIN only
+    rng = np.random.default_rng(seed_base + 1000 * ii + int(round(float(ds_factor) * 10)))
+    idx_keep_tr = downsample_train_indices(
+        y_hb=y_tr_hb, y_sz=y_tr_sz, eval_flat=eval_flat_tr,
+        ds_factor=ds_factor, rng=rng, threshold_cm=threshold_cm
+    )
+
+    X_tr_bal = X_tr[idx_keep_tr, :]
+    y_tr_bal = y_tr[idx_keep_tr]
+
+    dtr_bal = xgb.DMatrix(X_tr_bal, label=y_tr_bal, missing=np.nan)
+    dval    = xgb.DMatrix(X_val,    label=y_val,    missing=np.nan)
+
+    # ----------------------------
+    # C) TEST: labels + predictors (no DS)
+    # ----------------------------
+    y_grid_hb_te = np.array(hail_bin_US[te_idx, 14:110, :]).astype(np.float32)
+    y_grid_hb_te[:, LSM_US < 0.5] = np.nan
+    valid_mask_te = ~np.isnan(y_grid_hb_te)
+    y_test_hb = y_grid_hb_te[valid_mask_te].astype(np.int8)
+
+    y_grid_sz_te = np.array(hail_size_US[te_idx, 14:110, :]).astype(np.float32)
+    y_grid_sz_te[:, LSM_US < 0.5] = np.nan
+    y_test_sz = y_grid_sz_te[valid_mask_te]
+    y_test = np.where(y_test_hb == 1, (y_test_sz >= threshold_cm).astype(np.int8), 0)
+
+    X_grid_te = np.array(rgrERAVarall_US[te_idx, :, :, :]).astype(np.float32)
+    X_grid_te[:, :, LSM_US < 0.5] = np.nan
+    X_f_tyx_te = np.moveaxis(X_grid_te, 1, 0)
+    X_test = X_f_tyx_te[:, valid_mask_te].T
+    X_test[:, 1] = np.abs(X_test[:, 1]); X_test[:, 5] = np.abs(X_test[:, 5])
+
+    dte = xgb.DMatrix(X_test, label=y_test, missing=np.nan)
+
+    return dtr_bal, dval, dte, y_test
+
+# ============================================================
+# RUN: ds_factors x folds -> AUCPR test
+# ============================================================
+rows = []
+
+for ds in ds_factors:
+    for ii, (tr_idx, te_idx) in enumerate(zip(fold_train, fold_test)):
+        dtr_bal, dval, dte, y_test = build_dmats_for_fold_ds(ii, tr_idx, te_idx, ds)
+
+        evals_result = {}
+        booster = xgb.train(
+            params=params,
+            dtrain=dtr_bal,
+            num_boost_round=num_boost_round,
+            evals=[(dtr_bal, "train"), (dval, "valid")],
+            early_stopping_rounds=early_stopping_rounds,
+            evals_result=evals_result,
+            verbose_eval=False,
+        )
+
+        y_prob = booster.predict(dte)
+        aucpr_test = aucpr_from_probs(y_test, y_prob)
+
+        rows.append({
+            "fold": ii,
+            "ds_factor": ds,
+            "best_iter": int(getattr(booster, "best_iteration", -1)),
+            "aucpr_test": float(aucpr_test),
+        })
+
+df = pd.DataFrame(rows)
+
+# ============================================================
+# PLOT: ds_factor vs mean test AUCPR
+# ============================================================
+summary = df.groupby("ds_factor")["aucpr_test"].agg(["mean", "std", "count"]).reset_index()
+
+plt.figure(figsize=(6.5, 4.2))
+plt.plot(summary["ds_factor"], summary["mean"], marker="o")
+plt.xlabel("ds_factor")
+plt.ylabel("Test AUCPR")
+plt.title("Test AUCPR vs ds_factor (fixed params, early stopping)")
+plt.tight_layout()
+plt.show()
+
+# Optional: show table
+print(summary)
+
+# Optional: save tidy results
+# df.to_csv(os.path.join(stats_dir, "aucpr_test_by_ds_factor.csv"), index=False)
+
+
+
