@@ -12,14 +12,14 @@ import cartopy.feature as cfeature
 import xgboost as xgb
 from xgboost import plot_importance
 
-# ============================================================
+# ========================================================================================================================
 # Post-analysis per fold (monthly curves + annual frequency maps + importance)
 # - OBS matches your LABEL: significant hail (hail==1 & size>=4.4cm)
 # - Optional masking for maps: with / without eval_cells_conus_buffer
+# ========================================================================================================================
 # ============================================================
-# -----------------------------
-# USER SETTINGS
-# -----------------------------
+# user settings
+# ============================================================
 thr_bin   = 0.3                 # threshold on probability for binary preds
 pred_dir  = "/cluster/home/agebhardt/predictions"
 model_dir = "/cluster/home/agebhardt/models"
@@ -36,9 +36,9 @@ make_maps_evalmask = True
 #   - compare over eval_cells_conus_buffer (recommended) or whole land
 monthly_use_evalmask = True
 
-# -----------------------------
-# HELPERS
-# -----------------------------
+# ============================================================
+# Helpers
+# ============================================================
 def as_bool_mask_2d(mask_like):
     """Return boolean numpy array (H,W) from np array or xarray DataArray."""
     m = np.asarray(mask_like)
@@ -102,10 +102,9 @@ def plot_two_panel_map(lon2d, lat2d, field_left, field_right, title_left, title_
         os.makedirs(os.path.dirname(outpath), exist_ok=True)
         fig.savefig(outpath, dpi=200, bbox_inches="tight")
 
-
-# -----------------------------
-# PREP MASKS / STATIC GRIDS
-# -----------------------------
+# ============================================================
+# prep masks / static grids
+# ============================================================
 eval_mask_2d = as_bool_mask_2d(eval_cells_conus_buffer)  # (H=96, W=300) expected for your CONUS slice
 # If your eval mask includes non-land, it’s fine; land is already NaN’ed via LSM_US in obs/model grids.
 
@@ -122,7 +121,6 @@ hail_sz_full  = rgrNOAAObs[1, :, :, :].astype(np.float32)
 # Significant hail label (matches training):
 hail_sig_full = np.where((hail_bin_full == 1) & np.isfinite(hail_sz_full) & (hail_sz_full >= threshold_cm),
                          1, 0).astype(np.int8)
-
 
 # ============================================================
 # MAIN LOOP
@@ -261,9 +259,9 @@ for ii, (tr_idx, te_idx) in enumerate(zip(fold_train, fold_test)):
     plt.savefig(f"plots/monthly_fold{ii}.png", dpi=200, bbox_inches="tight")
     plt.show()
 
-    # ============================================================
+    # -------------------------------
     # 7) Spatial maps: annual frequency per grid cell (obs vs model)
-    # ============================================================
+    # -------------------------------
     # Build annual frequencies (events per grid cell per year) over the test split
     obs_freq_test = np.nansum(y_grid_hb_te, axis=0) / max(1, n_test_years)
     mod_freq_test = np.nansum(hail_pred_bin_test, axis=0) / max(1, n_test_years)
@@ -324,9 +322,9 @@ for ii, (tr_idx, te_idx) in enumerate(zip(fold_train, fold_test)):
     #         outpath=f"maps/map_sig_hail_frequency_fold{ii}_evalmask.png",
     #     )
 
-    # ============================================================
+    # -------------------------------
     # 8) Feature importance (works without X_train_bal)
-    # ============================================================
+    # -------------------------------
     # model_path = os.path.join(model_dir,"20251215", f"xgb_us_fold{ii}.json")
     # booster = xgb.Booster()
     # booster.load_model(model_path)
@@ -345,3 +343,181 @@ for ii, (tr_idx, te_idx) in enumerate(zip(fold_train, fold_test)):
     # plt.title(f"Fold {ii} | Feature importance (cover)")
     # plt.tight_layout()
     # plt.show()
+
+# ========================================================================================================================
+# Analysis on new predictions for selected model
+# ========================================================================================================================
+# ------------------------------------------------------------
+# 1) Time vector (1959–2022, skip 2003)
+# ------------------------------------------------------------
+dStartDay = datetime.datetime(1959, 1, 1, 0)
+dStopDay  = datetime.datetime(2022, 12, 31, 23)
+
+rgdTimeDD = pd.date_range(dStartDay, end=dStopDay, freq="d")
+mask_no_2003_days = (rgdTimeDD.year != 2003)
+rgdTimeDD = rgdTimeDD[mask_no_2003_days]
+
+years_all = np.unique(rgdTimeDD.year)  # includes 1959..2022 without 2003
+
+# ------------------------------------------------------------
+# 2) Load ERA5 predictors for CONUS and stack into rgrERAVarall_US
+#    Expected each NPZ contains: rgrERAVarsyy (T_year, F, ny, nx), rgrLat, rgrLon
+# ------------------------------------------------------------
+conus_dir = "/nfs/cumulus/highres_nobackup/agebhardt/e5_hailpredictors_conus/"
+
+# You already have:
+#   rgsModelVars (length F)
+#   ny, nx
+#   LSM_US (ny, nx) already prepared in your notebook/script
+F = len(rgsModelVars)
+T_all = len(rgdTimeDD)
+
+rgrERAVarall_US = np.full((T_all, F, ny, nx), np.nan, dtype=np.float32)
+
+t0 = 0
+for yr in years_all:
+    infile = os.path.join(conus_dir, f"ERA5_new_predictors_conus_{yr}.npz")
+    if not os.path.exists(infile):
+        print(f"Missing: {infile} -> skip")
+        continue
+
+    data_tmp = np.load(infile)
+    rgrERAVarsyy = data_tmp["rgrERAVarsyy"].astype(np.float32)  # (T_year, F, ny, nx)
+    yearlength = rgrERAVarsyy.shape[0]
+
+    rgrERAVarall_US[t0:t0+yearlength, :, :, :] = rgrERAVarsyy
+    t0 += yearlength
+
+    # lat/lon (usually constant)
+    rgrLat_US = data_tmp["rgrLat"]
+    rgrLon_US = data_tmp["rgrLon"]
+
+assert t0 == T_all, f"Time stacking mismatch: filled {t0} days, expected {T_all}"
+
+# ------------------------------------------------------------
+# 3) Prepare X for prediction: keep NaNs, use missing=np.nan
+#    Apply abs-transform to selected features (like your training)
+#    Apply land mask to predictors
+# ------------------------------------------------------------
+X_grid = rgrERAVarall_US.copy()  # (T, F, ny, nx)
+
+# land mask (set sea to NaN)
+X_grid[:, :, LSM_US < 0.5] = np.nan
+
+# abs-transform like in training (feature indices 1 and 5 in your pipeline)
+X_grid[:, 1, :, :] = np.abs(X_grid[:, 1, :, :])
+X_grid[:, 5, :, :] = np.abs(X_grid[:, 5, :, :])
+
+# flatten to (N_samples, F) where N_samples = T*ny*nx (but with NaNs on sea)
+# We’ll predict for ALL gridcells/days, but keep NaNs where sea or missing.
+T, F, H, W = X_grid.shape
+X_flat = np.moveaxis(X_grid, 1, 0)          # (F, T, H, W)
+X_flat = X_flat.reshape(F, -1).T            # (T*H*W, F)
+
+# Create DMatrix with missing NaNs
+d_pred = xgb.DMatrix(X_flat, missing=np.nan)
+
+# ------------------------------------------------------------
+# 4) Load one saved model and predict probabilities
+# ------------------------------------------------------------
+# choose a model:
+fold_to_use = 2
+model_path = os.path.join("models", f"xgb_us_fold{fold_to_use}.json")
+
+booster = xgb.Booster()
+booster.load_model(model_path)
+
+y_prob_flat = booster.predict(d_pred)  # (T*H*W,)
+
+# reshape back to (T, H, W)
+y_prob = y_prob_flat.reshape(T, H, W)
+
+# optional: binary events
+thr_bin = 0.5  # choose your threshold
+y_bin = (y_prob >= thr_bin).astype(np.int8)
+
+# ------------------------------------------------------------
+# 5) Annual hail frequency per grid cell (events per year)
+#    Here: mean annual frequency over 1959–2022 (excluding 2003)
+# ------------------------------------------------------------
+years_vec = rgdTimeDD.year.to_numpy()
+unique_years = np.unique(years_vec)
+n_years = len(unique_years)
+
+annual_sum = np.zeros((H, W), dtype=np.float32)
+for yr in unique_years:
+    idx = (years_vec == yr)
+    annual_sum += np.nansum(y_bin[idx, :, :], axis=0)
+
+mean_annual_freq = annual_sum / n_years  # (H, W)
+
+# ------------------------------------------------------------
+# 6) Plot maps: (a) unmasked, (b) masked to eval_cells_conus_buffer
+# ------------------------------------------------------------
+def plot_mean_annual_frequency_map(field_hw, title, extent=(-127, -66, 24, 50),
+                                  savepath=None):
+    hail_prob_colors = [
+        (1, 1, 1), (0.8, 0.92, 1), (0.7, 0.85, 0.95),
+        (0.55, 0.75, 0.92), (0.33, 0.58, 0.9), (0.13, 0.38, 0.8),
+        (0.15, 0.3, 0.65), (0.12, 0.22, 0.55), (0.0, 0.4, 0),
+        (0.0, 0.7, 0.2), (1.0, 1.0, 0.0),
+        (1.0, 0.7, 0.0), (1.0, 0.4, 0.0), (1.0, 0, 0.0),
+        (0.9, 0.0, 0.0), (0.7, 0.0, 0.0), (0.5, 0.0, 0.0),
+    ]
+    cmap = ListedColormap(hail_prob_colors)
+    intervals = np.array([
+        0.00, 0.01, 0.05, 0.10, 0.20, 0.35, 0.50, 0.70,
+        1.00, 1.50, 2.0, 3.00, 4.0, 5.00, 7.0, 9.00, 10.0
+    ])
+    norm = mcolors.BoundaryNorm(intervals, len(intervals) - 1)
+
+    # If your rgrLat_US / rgrLon_US are 2D (ny,nx) you're good; if 1D, adapt.
+    lat2d = rgrLat_US
+    lon2d = rgrLon_US
+
+    fig = plt.figure(figsize=(11, 5))
+    ax = plt.axes(projection=ccrs.PlateCarree())
+
+    pcm = ax.pcolormesh(
+        lon2d, lat2d, field_hw,
+        cmap=cmap, norm=norm, shading="auto",
+        transform=ccrs.PlateCarree(),
+    )
+
+    ax.coastlines()
+    ax.add_feature(cfeature.BORDERS, linestyle="-", alpha=0.5)
+    ax.add_feature(cfeature.STATES, linestyle="-", edgecolor="black", alpha=0.5)
+    ax.set_extent(extent, crs=ccrs.PlateCarree())
+    ax.set_title(title)
+
+    cbar = plt.colorbar(pcm, ax=ax, orientation="horizontal", pad=0.08, extend="max")
+    cbar.set_label("Mean annual hail frequency (events per grid cell)")
+
+    plt.tight_layout()
+    if savepath is not None:
+        os.makedirs(os.path.dirname(savepath), exist_ok=True)
+        plt.savefig(savepath, dpi=200, bbox_inches="tight")
+    plt.show()
+
+
+# (a) UNMASKED (but still land-only because LSM masked earlier)
+title_unmasked = f"Modeled mean annual hail frequency (binary thr={thr_bin})\n{unique_years.min()}–{unique_years.max()} (excl. 2003), fold {fold_to_use}"
+plot_mean_annual_frequency_map(
+    mean_annual_freq,
+    title_unmasked,
+    savepath=f"maps/pred_mean_annual_freq_fold{fold_to_use}_unmasked.png",
+)
+
+# (b) MASKED to eval_cells_conus_buffer
+# Make sure eval_cells_conus_buffer is (H,W) bool for the CONUS grid.
+masked_freq = mean_annual_freq.copy()
+masked_freq[~eval_cells_conus_buffer] = np.nan
+
+title_masked = f"Modeled mean annual hail frequency (masked to eval_cells)\n(binary thr={thr_bin}), {unique_years.min()}–{unique_years.max()} (excl. 2003), fold {fold_to_use}"
+plot_mean_annual_frequency_map(
+    masked_freq,
+    title_masked,
+    savepath=f"maps/pred_mean_annual_freq_fold{fold_to_use}_evalmask.png",
+)
+
+
