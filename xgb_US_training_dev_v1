@@ -1,0 +1,363 @@
+# libraries
+import calendar 
+from calendar import monthrange, isleap
+import csv
+from datetime import datetime, timedelta
+import math
+from math import radians, cos, sin, asin, sqrt
+import os
+import os.path
+import random
+import string
+import sys
+import traceback
+
+# Externe Pakete
+from dateutil import rrule
+import dateutil.parser as dparser
+
+import numpy as np
+import numpy.ma as ma
+
+import scipy
+from scipy import stats
+import scipy.ndimage as ndimage
+from scipy.interpolate import griddata, interp1d
+from scipy.stats import gaussian_kde
+
+import pandas as pd
+import xarray as xr 
+
+import xgboost as xgb
+from xgboost import XGBClassifier
+
+from netCDF4 import Dataset
+from netCDF4 import Dataset as netcdf_dataset
+
+import matplotlib as mpl
+#mpl.use("Agg")
+import matplotlib.colors as colors
+import matplotlib.colors as mcolors
+from matplotlib.cm import ScalarMappable
+import matplotlib.gridspec as gridspec
+import matplotlib.patches as mpatches
+import matplotlib.path as mplPath
+from matplotlib.patches import Polygon
+from matplotlib.collections import PatchCollection
+from matplotlib.colors import (
+    BoundaryNorm,
+    LinearSegmentedColormap,
+    ListedColormap,
+    LogNorm,
+)
+from matplotlib.ticker import LogLocator
+import matplotlib.pyplot as plt
+import matplotlib.patches as mpatch  # nur behalten, wenn du beide Aliase brauchst
+
+import geopandas as gpd
+
+from cartopy import config
+import cartopy.crs as ccrs
+import cartopy.feature as cfeature
+
+from sklearn.metrics import (
+    accuracy_score,
+    average_precision_score,
+    auc,
+    confusion_matrix,
+    f1_score,
+    log_loss,
+    matthews_corrcoef,
+    mean_squared_error,
+    precision_recall_curve,
+    precision_score,
+    recall_score,
+    roc_auc_score,
+    roc_curve,
+)
+from sklearn.model_selection import (
+    cross_val_score,
+    StratifiedKFold,
+    StratifiedShuffleSplit,
+    train_test_split,
+)
+
+from hyperopt import STATUS_OK, Trials, fmin, hp, space_eval, tpe
+
+from skopt import gp_minimize
+from skopt.space import Integer, Real
+from skopt.utils import use_named_args
+
+import optuna
+from optuna.samplers import TPESampler
+from optuna.trial import TrialState
+from optuna import Trial  # Visualization
+from optuna.integration import XGBoostPruningCallback
+
+import re
+
+dStartDay=datetime(2000, 1, 1, 0) # 2003 is missing
+dStopDay=datetime(2022, 12, 31,23)
+    
+#generate time vectors
+rgdTimeDD = pd.date_range(dStartDay, end=dStopDay, freq='d')
+rgdTime1H = pd.date_range(dStartDay, end=dStopDay, freq='1h')
+
+# Mask: keep everything except the missing year 2003
+mask_no_2003_days = rgdTimeDD.year != 2003
+mask_no_2003_hours = rgdTime1H.year != 2003
+
+rgdTimeDD = rgdTimeDD[mask_no_2003_days]
+rgdTime1H = rgdTime1H[mask_no_2003_hours]
+
+iMonths=np.unique(rgdTimeDD.month)
+iYears=np.unique(rgdTimeDD.year)
+
+rgdFullTime=pd.date_range(datetime(1959, 1, 1, 0),
+                          end=datetime(2022, 12, 31, 23), freq='1h')
+rgdFullTime_day=pd.date_range(datetime(1959, 1, 1, 0),
+                          end=datetime(2022, 12, 31, 23), freq='d')
+
+rgsModelVars_4i=['CAPEmax',
+              'SRH03',
+              'VS03',
+              'FLH']
+
+rgsModelVars_7n=['CINmax',
+              'SRH06',
+              'VS06',
+              'DewT',
+              'TotalTotals',
+              'RH850',
+              'RH500']
+
+rgsModelVars=['CAPEmax',
+              'SRH03',
+              'VS03',
+              'FLH',
+              'CINmax',
+              'SRH06',
+              'VS06',
+              'DewT',
+              'TotalTotals',
+              'RH850',
+              'RH500'
+             ]
+
+# Initial 4 variables
+rgsVarsAct_4i=(np.array([rgsModelVars_4i[ll].split('-') for ll in range(len(rgsModelVars_4i))]))
+rgsERAVariables_4i = np.array([item for sublist in rgsVarsAct_4i for item in sublist])
+
+# Additional 7 variables
+rgsVarsAct_7n =(np.array([rgsModelVars_7n[ll].split('-') for ll in range(len(rgsModelVars_7n))]))
+rgsERAVariables_7n = np.array([item for sublist in rgsVarsAct_7n for item in sublist])
+
+# All variables 
+rgsVarsAct=(np.array([rgsModelVars[ll].split('-') for ll in range(len(rgsModelVars))]))
+rgsERAVariables = np.array([item for sublist in rgsVarsAct for item in sublist])
+
+# Read Observations from NOAA
+sSaveFolder = ("/nfs/cumulus/highres_nobackup/agebhardt/hail_observations/SPC_data_griddedERA/")
+sDataSet = 'NOAA'
+
+hailsize = ['Hail', 'HailSize']
+rgrNOAAObs=np.zeros((2, len(rgdTimeDD), 130, 300))
+
+for ii in range(len(hailsize)):
+    dd=0
+    for yy in range(len(iYears)):
+        #print('Loadind NOAA data for year '+str(iYears[yy]))
+        sFileName=sSaveFolder+'SPC-Hail-StormReports_gridded-75km_'+str(iYears[yy])+'.nc'
+
+        # read in the variables
+        ncid=Dataset(sFileName, mode='r')
+
+        rgrLatGrid=np.squeeze(ncid.variables['lat'][:,0]) # 1D, shape(130,)
+        rgrLonGrid=np.squeeze(ncid.variables['lon'][0,:]) # 1D, shape(300,)
+        rgrLonNOAA=np.asarray(([rgrLonGrid,]*rgrLatGrid.shape[0])) # 2D, shape(130,300): each row is a copy of rgrLonGrid, so long varies across columns and is constant down each row.
+        rgrLatNOAA=np.asarray(([rgrLatGrid,]*rgrLonGrid.shape[0])).transpose() #2D, shape(130,300)
+        yearlength=365 + calendar.isleap(iYears[yy])
+        
+        rgrNOAAObs[ii,dd:dd+yearlength,:,:]=np.squeeze(ncid.variables[hailsize[ii]][:])
+        
+        dd=dd+yearlength
+        ncid.close()
+
+#--------------------------------------------------------------------------
+# Read latitude, longitude and height from ERA (sERAconstantFields)
+rgsERAdata = "/nfs/cumulus/highres_nobackup/agebhardt/e5_hailpredictors/"
+rgsERAdata_conus = "/nfs/cumulus/highres_nobackup/agebhardt/e5_hailpredictors_conus/"
+sERAconstantFields = "/nfs/cumulus/highres_nobackup/agebhardt/e5_data_processing/e5_invariant/e5_invariant_129_z_ll025sc.2020010100_2020010100.nc"
+
+ncid=Dataset(sERAconstantFields, mode='r')
+rgrLat=np.squeeze(ncid.variables['latitude'][:]) #lat1d_global
+rgrLon=np.squeeze(ncid.variables['longitude'][:]) #lon1d_global
+rgrHeight=(np.squeeze(ncid.variables['z'][:]))/9.81
+ncid.close()
+
+rgiSize=rgrHeight.shape
+
+# all lon grids have to be -180 to 180 degree
+rgrLatERA=np.asarray(([rgrLat,]*rgrLon.shape[0])).transpose() #lat2d_global
+rgrLonERA=np.asarray(([rgrLon,]*rgrLat.shape[0])) #lon2d_global
+rgi180=np.where(rgrLonERA > 180)
+rgrLonERA[rgi180]=rgrLonERA[rgi180]-360.
+
+# --------------------------------------------------------------------------
+# match NOAA-Domain to ERA5 → Lon-/Lat-Indices for CONUS
+# --------------------------------------------------------------------------
+rgrLonAct = rgrLonNOAA
+rgrLatAct = rgrLatNOAA
+
+# ERA-Lon-Indices zwischen westlicher und östlicher NOAA-Gitterkante
+rgiLon = np.where(
+    (rgrLonERA[0, :] >= rgrLonAct[0, 0]) &
+    (rgrLonERA[0, :] <= rgrLonAct[0, -1])
+)[0]
+
+# ERA-Lat-Indices zwischen nördlicher und südlicher NOAA-Gitterkante
+rgiLat = np.where(
+    (rgrLatERA[:, 0] <= rgrLatAct[0, 0]) &     # North
+    (rgrLatERA[:, 0] >= rgrLatAct[-1, 0])      # South
+)[0]
+
+ilaN = rgiLat[0]
+iloW = rgiLon[0]
+ilaS = rgiLat[-1] + 1   # stop-exklusiv
+iloE = rgiLon[-1] + 1
+
+# inneres US-Band (wie bisher: 164..260) innerhalb des globalen Lat-Index
+latN_us = 164
+latS_us = 260
+
+assert 0 <= latN_us < latS_us <= rgrLatERA.shape[0]
+
+ny = latS_us - latN_us
+nx = iloE - iloW
+
+# 1D-Lat/Lon für CONUS-Ausschnitt (praktisch für plots)
+lat_us = rgrLat[latN_us:latS_us]
+lon_us = rgrLon[iloW:iloE]
+
+print("CONUS shape (ny, nx):", ny, nx)
+
+# --------------------------------------------------------------------------
+# ERA5-Prädiktoren: NUR CONUS lesen und als .npz pro Jahr speichern
+# --------------------------------------------------------------------------
+conus_dir = "/nfs/cumulus/highres_nobackup/agebhardt/e5_hailpredictors_conus/"
+
+rgrERAVarall = np.zeros(
+    (len(rgdTimeDD), len(rgsERAVariables), ny, nx),
+    dtype=np.float32,
+)
+iyear = 0
+
+for year in iYears:
+    if year == 2003:
+        continue
+
+    infile = os.path.join(conus_dir, f"ERA5_new_predictors_conus_{year}.npz")
+    data_tmp = np.load(infile)
+
+    rgrERAVarsyy = data_tmp["rgrERAVarsyy"]  # (T_year, F, ny, nx)
+    yearlength = rgrERAVarsyy.shape[0]
+
+    rgrERAVarall[iyear:iyear+yearlength, :, :, :] = rgrERAVarsyy
+    iyear += yearlength
+
+    # falls du Lat/Lon brauchst:
+    rgrLat_US = data_tmp["rgrLat"]
+    rgrLon_US = data_tmp["rgrLon"]
+
+#--------------------------------------------------------------------------
+#get the grid cells covered with land only (land-sea-mask lsm)
+invar_dir = "/nfs/cumulus/highres_nobackup/agebhardt/e5_data_processing/e5_invariant/"
+sFileName = invar_dir + "/e5_lsm_11024sc.nc"
+ncid = Dataset(sFileName, mode='r')
+LSM = np.squeeze(ncid.variables['lsm'][:])
+ncid.close()
+#--------------------------------------------------------------------------
+rgrERAVarall_US = rgrERAVarall
+LSM_US = LSM[164:260,iloW:iloE]
+
+gpw_dir = "/nfs/cumulus/highres_nobackup/agebhardt/gpw/"
+npz_path = gpw_dir + "gpw_2020_era025.npz"
+
+# --- Load GPW data ---
+with np.load(npz_path, allow_pickle=False) as npz:
+    popdens_data = npz["data"].astype("float32")  # persons / km² on ERA grid
+    latitudes    = npz["lat"].astype("float32")
+    longitudes   = npz["lon"].astype("float32")
+    density_units = str(npz["units"])
+    var_desc      = str(npz["long_name"])
+    ref_year      = int(npz["year"])
+
+popdens_era = xr.DataArray(
+    popdens_data,
+    coords={"latitude": latitudes, "longitude": longitudes},
+    dims=("latitude", "longitude"),
+    name=f"gpw_pop_density_{ref_year}_era025",
+    attrs={
+        "units": density_units,
+        "description": var_desc,
+        "reference_year": ref_year,
+        "grid": "ERA 0.25° regular lat-lon",
+        "source": "SEDAC GPWv4 Rev11 regridded to ERA 0.25°",
+    },
+)
+
+# --- Subsetting helper ---
+def subset_bbox(da: xr.DataArray, bbox, lon_name="longitude", lat_name="latitude") -> xr.DataArray:
+    """Subset to bbox = (min_lon, max_lon, min_lat, max_lat)."""
+    min_lon, max_lon, min_lat, max_lat = map(float, bbox)
+
+    out = da.sel({lon_name: slice(min_lon, max_lon)})
+    lat_vals = out[lat_name].values
+    if lat_vals.size == 0:
+        raise ValueError("Longitude slice returned empty result; check bbox or lon convention.")
+
+    # handle ascending/descending latitude
+    lat_slice = slice(min_lat, max_lat) if lat_vals[0] <= lat_vals[-1] else slice(max_lat, min_lat)
+    return out.sel({lat_name: lat_slice})
+
+# --- subset CONUS ---
+bbox_conus = (-135.0, -60.25, 20.25, 52.5)
+popdens_conus = subset_bbox(popdens_era, bbox_conus)
+
+print("popdens_conus shape:", popdens_conus.shape)
+print("popdens lat range:", popdens_conus.latitude.values[0], "to", popdens_conus.latitude.values[-1])
+print("popdens lon range:", popdens_conus.longitude.values[0], "to", popdens_conus.longitude.values[-1])
+
+# --- Top 15 % cells (by pop density) ---
+popdens_threshold = float(np.nanpercentile(popdens_conus.values, 85))
+popmask_top15 = popdens_conus >= popdens_threshold
+
+valid = np.isfinite(popdens_conus.values)
+select = popmask_top15.values & valid
+print(
+    f"Threshold = {popdens_threshold:.1f} ppl/km² | "
+    f"selected {select.sum()} of {valid.sum()} cells (~{100*select.sum()/valid.sum():.1f}%)"
+)
+
+# Crop latitude band 14:110
+eval_cells_conus = popmask_top15.values[14:110, :]
+print("shape of eval_cells_conus:", eval_cells_conus.shape)
+
+# --- top 15% + buffer of 2 grid cells ---
+radius_cells = 2
+structure = ndimage.iterate_structure(
+    ndimage.generate_binary_structure(rank=2, connectivity=1),
+    radius_cells,
+)
+mask_buffered = ndimage.binary_dilation(popmask_top15.values, structure=structure)
+
+eval_cells_conus_buffer = xr.DataArray(
+    mask_buffered,
+    coords=popdens_conus.coords,
+    dims=popdens_conus.dims,
+    name="eval_cells_conus",
+)[14:110, :]
+
+print("shape of eval_cells_conus_buffer:", eval_cells_conus_buffer.shape)
+print("Buffered cells:", mask_buffered.sum())
+
