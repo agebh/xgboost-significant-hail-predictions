@@ -80,6 +80,8 @@ for y in iYears:
 
     dd += yearlength
 print(f"NOAA observations are read in...")
+print(f"rgrNOAAobs shape:", rgrNOAAObs.shape)
+print(f"NOAA lat/Lon grid shape: {rgrLatNOAA.shape}, {rgrLonNOAA.shape}")
 
 # ============================================================
 # 4) Read ERA invariant fields (lat/lon/height) and shift lon to [-180, 180]
@@ -95,7 +97,9 @@ rgrLon = np.where(rgrLon > 180, rgrLon - 360, rgrLon)
 # 2D lat/lon grids (optional, but matches your original)
 rgrLatERA = np.tile(rgrLat[:, None], (1, rgrLon.size))
 rgrLonERA = np.tile(rgrLon[None, :], (rgrLat.size, 1))
+
 print(f"ERA invariant fields are read in...")
+print(f"ERA lat/lon shape (global): {rgrLatERA.shape}, {rgrLonERA.shape}")
 
 # ============================================================
 # 5) Match NOAA domain to ERA indices (CONUS lon indices) + derive nx/ny
@@ -113,7 +117,8 @@ lat_us = rgrLat[latn_us:lats_us]
 lon_us = rgrLon[iloW:iloE]
 
 print(f"NOAA domain matched to ERA indices...")
-print("CONUS shape (ny, nx):", ny, nx)
+print(f"CONUS lat/lon shape (ny, nx): {ny}, {nx}")
+print(f"CONUS lat/lon shape (lat_us, lon_us): {lat_us}, {lon_us}")
 
 # ============================================================
 # 6) Read ERA5 predictors (CONUS domain, yearly .npz)
@@ -138,7 +143,7 @@ for y in iYears:
     rgrLat_US = data_tmp.get("rgrLat", None)
     rgrLon_US = data_tmp.get("rgrLon", None)
 
-print(f"ERA5 predictors read in...")
+print(f"ERA5 predictors are read in...")
 
 # ============================================================
 # 7) Land-sea mask (CONUS)
@@ -176,6 +181,7 @@ popdens_conus = popdens_conus.sel(latitude=lat_slice)
 popdens_threshold = float(np.nanpercentile(popdens_conus.values, 85))  # top 15%
 popmask_top15 = (popdens_conus >= popdens_threshold) & np.isfinite(popdens_conus.values)
 
+print(f"Population density mask is read in...")
 print(
     f"Threshold = {popdens_threshold:.1f} ppl/km² | "
     f"selected {int(popmask_top15.values.sum())} of {int(np.isfinite(popdens_conus.values).sum())} cells"
@@ -193,18 +199,46 @@ structure = ndimage.iterate_structure(
 mask_buffered = ndimage.binary_dilation(popmask_top15.values, structure=structure)
 eval_cells_conus_buffer = mask_buffered[noaa_lat_slice, :]
 
-print(f"Population density mask read in...")
 print("shape eval_cells_conus:", eval_cells_conus.shape)
 print("shape eval_cells_conus_buffer:", eval_cells_conus_buffer.shape)
+print(f"Preprocessing is finished")
 # ========================================================================================================================
 # Training and Tuning
 # ========================================================================================================================
+# ============================================================
+# 0) Imports
+# ============================================================
+import os
+import re
+import xgboost as xgb
+import matplotlib as mpl
+#mpl.use("Agg")
+import matplotlib.pyplot as plt
+
+import optuna
+from optuna.samplers import TPESampler
+try:
+    from optuna_integration.xgboost import XGBoostPruningCallback
+except ModuleNotFoundError:
+    from optuna.integration import XGBoostPruningCallback
+from optuna.visualization import plot_contour
+
+from sklearn.metrics import (
+    auc,
+    average_precision_score,
+    confusion_matrix,
+    log_loss,
+    precision_recall_curve,
+    roc_auc_score,
+    roc_curve,
+)
+
 # ============================================================
 # 1) CV Settings + fold construction
 # ============================================================
 n_folds = 2
 year_start = 2000
-year_end = 2020 #2010
+year_end = 2020
 block_size = 2
 
 all_years = pd.DatetimeIndex(rgdTimeDD).year
@@ -685,7 +719,7 @@ for ii, (tr_idx, te_idx) in enumerate(zip(fold_train, fold_test)):
         return float(booster_hp_tuning.best_score)
     
     sampler = TPESampler(seed=42+ii)
-    pruner = optuna.pruners.MedianPrunder(
+    pruner = optuna.pruners.MedianPruner(
         n_startup_trials=15,
         n_warmup_steps=30,
         interval_steps=5
@@ -759,6 +793,7 @@ for ii, (tr_idx, te_idx) in enumerate(zip(fold_train, fold_test)):
     print(f"Saved AUCPR plot for fold {ii} to: {plots_path}")
         
     # --- contour plots --------------------------------------
+    # only makes sense for large search space
     fig_contour_lr_md = plot_contour(
         study,
         params=["learning_rate","max_depth"],
@@ -812,37 +847,37 @@ for ii, (tr_idx, te_idx) in enumerate(zip(fold_train, fold_test)):
     pred_test_median = float(np.median(y_test_prob))
     
     # ---- threshold-based metrics (confusion matrix) ----
-    thr = 0.5  # IMPORTANT: consider choosing this from validation later
-    cm = confusion_metrics(y_test, y_test_prob, thr=thr)
-    cm_norm = confusion_matrix_normalized(y_test, y_test_prob, thr=thr, normalize="true")  # row-normalized
+    # thr = 0.5  # IMPORTANT: consider choosing this from validation later
+    # cm = confusion_metrics(y_test, y_test_prob, thr=thr)
+    # cm_norm = confusion_matrix_normalized(y_test, y_test_prob, thr=thr, normalize="true")  # row-normalized
     
-    print(
-        f"[Fold {ii}] AUCROC={aucroc_test:.4f} AUCPR={aucpr_test:.4f} LogLoss={logloss_test:.4f} "
-        f"| thr={thr:.2f} TP={cm['tp']} FP={cm['fp']} TN={cm['tn']} FN={cm['fn']} "
-        f"| Acc={cm['accuracy']:.4f} Prec={cm['precision']:.4f} "
-        f"Sens={cm['sensitivity']:.4f} Spec={cm['specificity']:.4f} F1={cm['f1']:.4f}"
-    )
+    # print(
+    #     f"[Fold {ii}] AUCROC={aucroc_test:.4f} AUCPR={aucpr_test:.4f} LogLoss={logloss_test:.4f} "
+    #     f"| thr={thr:.2f} TP={cm['tp']} FP={cm['fp']} TN={cm['tn']} FN={cm['fn']} "
+    #     f"| Acc={cm['accuracy']:.4f} Prec={cm['precision']:.4f} "
+    #     f"Sens={cm['sensitivity']:.4f} Spec={cm['specificity']:.4f} F1={cm['f1']:.4f}"
+    #)
     
     # ---- ROC + PR plots (per fold) ----
-    plot_prefix = os.path.join(stats_dir, f"fold{ii}")
-    _roc, _pr = plot_roc_pr(
-        y_true=y_test,
-        y_prob=y_test_prob,
-        title_prefix=f"Fold {ii}",
-        outpath_prefix=plot_prefix
-    )
+    # plot_prefix = os.path.join(stats_dir, f"plot_roc_pr_fold{ii}")
+    # _roc, _pr = plot_roc_pr(
+    #     y_true=y_test,
+    #     y_prob=y_test_prob,
+    #     title_prefix=f"Fold {ii}",
+    #     outpath_prefix=plot_prefix
+    # )
     
     # ---- normalized confusion matrix plot (per fold) ----
-    plot_confmat(
-        cm_norm,
-        title=f"Fold {ii} Confusion Matrix (normalized by true class), thr={thr:.2f}",
-        outpath=plot_prefix + "_confmat_norm.png",
-    )
+    # plot_confmat(
+    #     cm_norm,
+    #     title=f"Fold {ii} Confusion Matrix (normalized by true class), thr={thr:.2f}",
+    #     outpath=plot_prefix + "_confmat_norm.png",
+    # )
     
     # ---- gain + lift (per fold) ----
-    df_gl = gain_lift_by_decile(y_test, y_test_prob, n_bins=10)
-    df_gl.to_csv(os.path.join(stats_dir, f"fold{ii}_gain_lift.csv"), index=False)
-    plot_gain_lift(df_gl, title_prefix=f"Fold {ii}", outpath_prefix=plot_prefix)
+    # df_gl = gain_lift_by_decile(y_test, y_test_prob, n_bins=10)
+    # df_gl.to_csv(os.path.join(stats_dir, f"fold{ii}_gain_lift.csv"), index=False)
+    # plot_gain_lift(df_gl, title_prefix=f"Fold {ii}", outpath_prefix=plot_prefix)
     
     # ============================================================
     # 5.8) Save model + predictions per fold
@@ -890,13 +925,13 @@ for ii, (tr_idx, te_idx) in enumerate(zip(fold_train, fold_test)):
             "pred_median_test": pred_test_median,
             
             # Confusion-matrix metrics (threshold-based)
-            "thr": cm["thr"],
-            "tp": cm["tp"], "fp": cm["fp"], "tn": cm["tn"], "fn": cm["fn"],
-            "accuracy": cm["accuracy"],
-            "precision_thr": cm["precision"],
-            "sensitivity": cm["sensitivity"],
-            "specificity": cm["specificity"],
-            "f1": cm["f1"],
+            # "thr": cm["thr"],
+            # "tp": cm["tp"], "fp": cm["fp"], "tn": cm["tn"], "fn": cm["fn"],
+            # "accuracy": cm["accuracy"],
+            # "precision_thr": cm["precision"],
+            # "sensitivity": cm["sensitivity"],
+            # "specificity": cm["specificity"],
+            # "f1": cm["f1"],
         }
     )
 
