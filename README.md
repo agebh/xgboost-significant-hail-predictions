@@ -1,2 +1,2 @@
 # xgboost-significant-hail-predictions
-This repository is for developing the xgboost classification model for predicting significant hail probabilities
+This repository contains the development of the XGBoost classification model for predicting significant hail probabilities.
