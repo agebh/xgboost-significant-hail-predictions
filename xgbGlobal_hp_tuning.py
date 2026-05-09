@@ -1123,13 +1123,6 @@ def main():
             "max_bin": 256,
             "seed": 42 + ii,
             "base_score": global_prevalence,
-            # "learning_rate": 0.018,
-            # "max_depth":  13,
-            # "min_child_weight": 35,
-            # "subsample": 0.68,
-            # "colsample_bytree": 0.7,
-            # "gamma": 0,
-            # "alpha": 0.1,
         }
 
         def objective(trial):
