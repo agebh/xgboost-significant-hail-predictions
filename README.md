@@ -12,3 +12,11 @@ It follows the same US–Europe combined modelling structure as the severe-hail 
 ### `model_dev_xgbUS_sigHail`
 US-only XGBoost training workflow for significant hail prediction using NOAA/SPC observations and ERA5 CONUS predictors.  
 This notebook focuses only on the US domain, applies a 4.4 cm hail-size threshold, prepares binary hail targets, performs cyclic two-year cross-validation, downsamples negative samples, trains XGBoost models, and produces prediction, evaluation, and interpretation outputs for the US region.
+
+### `XGBoost_analysis_visualization.ipynb`
+Analysis and visualization notebook for evaluating the XGBoost hail prediction models.  
+It compares observations with `xgbGlobal` and `xgbUS` predictions using seasonal cycles, spatial diagnostics, annual time series, city-level 3×3 grid-box averages, cross-validated fold summaries, ERA5 predictor analyses, outlier diagnostics, and model-performance visualizations such as PR/ROC curves and SHAP-based interpretation plots. 
+
+### `predictions_xgbGlobal_1959-2024.ipynb`
+Prediction and visualization notebook for the final `xgbGlobal_sigHail` model over **1959–2024**.  
+It applies the trained global XGBoost model year by year to ERA5 predictor fields, saves annual prediction outputs for the global grid, CONUS, and Europe, and creates mean annual frequency maps, global/regional inset maps, and annual time series for global, regional, and selected city-level hail frequency.
