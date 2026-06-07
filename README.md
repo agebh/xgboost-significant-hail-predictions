@@ -9,6 +9,10 @@ It combines US NOAA/SPC and European ESSL observations with ERA5 predictors, app
 Global XGBoost training workflow for significant hail prediction using a higher hail-size threshold of **4.4 cm**.  
 It follows the same US–Europe combined modelling structure as the severe-hail workflow, but uses different class-balancing settings and regional contribution weights to better represent rarer significant-hail events.
 
+### `model_dev_xgbGlobal_sigHail_tuning`
+Global XGBoost hyperparameter-tuning workflow for significant hail prediction over the US and Europe.  
+The script uses NOAA/SPC and ESSL hail observations, ERA5 hail predictors, land-sea masks, and cyclic two-year cross-validation folds. It applies a **4.4 cm hail-size threshold**, performs region-specific negative downsampling, tunes XGBoost hyperparameters with Optuna, compares tuned and baseline models, saves fold-specific models and predictions, and exports validation/test metrics, PR/ROC curves, AUCPR learning curves, and Optuna trial summaries.
+
 ### `model_dev_xgbUS_sigHail`
 US-only XGBoost training workflow for significant hail prediction using NOAA/SPC observations and ERA5 CONUS predictors.  
 This notebook focuses only on the US domain, applies a 4.4 cm hail-size threshold, prepares binary hail targets, performs cyclic two-year cross-validation, downsamples negative samples, trains XGBoost models, and produces prediction, evaluation, and interpretation outputs for the US region.
